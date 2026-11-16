@@ -605,6 +605,161 @@ class TestGcpCdnProvider:
         assert result.ok is False
         assert result.retryable is False
 
+    @pytest.mark.parametrize(
+        ("body", "reason"),
+        [
+            pytest.param(
+                {
+                    "error": {
+                        "code": 403,
+                        "errors": [{"domain": "usageLimits", "reason": "rateLimitExceeded"}],
+                    }
+                },
+                "rateLimitExceeded",
+                id="legacy-rateLimitExceeded",
+            ),
+            pytest.param(
+                {
+                    "error": {
+                        "code": 403,
+                        "errors": [{"domain": "usageLimits", "reason": "userRateLimitExceeded"}],
+                    }
+                },
+                "userRateLimitExceeded",
+                id="legacy-userRateLimitExceeded",
+            ),
+            pytest.param(
+                {
+                    "error": {
+                        "code": 403,
+                        "status": "PERMISSION_DENIED",
+                        "details": [
+                            {
+                                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                "reason": "RATE_LIMIT_EXCEEDED",
+                            }
+                        ],
+                    }
+                },
+                "RATE_LIMIT_EXCEEDED",
+                id="errorinfo-RATE_LIMIT_EXCEEDED",
+            ),
+            pytest.param(
+                {"error": {"code": 403, "status": "RESOURCE_EXHAUSTED"}},
+                "RESOURCE_EXHAUSTED",
+                id="status-RESOURCE_EXHAUSTED",
+            ),
+        ],
+    )
+    @respx.mock
+    async def test_rate_limit_403_is_retryable(
+        self, gcp_sa_file: Path, body: dict[str, object], reason: str
+    ) -> None:
+        respx.post(
+            "https://compute.googleapis.com/compute/v1/projects/alma-prod"
+            "/global/urlMaps/alma-prod-lb/invalidateCache"
+        ).mock(return_value=httpx.Response(403, json=body))
+        with patch("mirror_mirage.providers.gcp.service_account") as mock_sa:
+            creds = MagicMock()
+            creds.token = "tok"
+            creds.expired = False
+            mock_sa.Credentials.from_service_account_file.return_value = creds
+            async with httpx.AsyncClient() as client:
+                p = GcpCdnProvider(
+                    project="alma-prod",
+                    url_map="alma-prod-lb",
+                    service_account_file=gcp_sa_file,
+                    client=client,
+                )
+                result = await p.purge(["https://cdn-eu.almalinux.org/almalinux/9/x.rpm"])
+        assert result.ok is False
+        assert result.retryable is True
+        assert reason in result.message
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            pytest.param(
+                httpx.Response(
+                    403,
+                    json={
+                        "error": {
+                            "code": 403,
+                            "status": "PERMISSION_DENIED",
+                            "errors": [{"domain": "global", "reason": "forbidden"}],
+                        }
+                    },
+                ),
+                id="permission-denied",
+            ),
+            pytest.param(httpx.Response(403, text="<html>Forbidden</html>"), id="non-json"),
+            pytest.param(httpx.Response(403, json=["unexpected"]), id="non-object-json"),
+        ],
+    )
+    @respx.mock
+    async def test_non_rate_limit_403_is_terminal(
+        self, gcp_sa_file: Path, response: httpx.Response
+    ) -> None:
+        respx.post(
+            "https://compute.googleapis.com/compute/v1/projects/alma-prod"
+            "/global/urlMaps/alma-prod-lb/invalidateCache"
+        ).mock(return_value=response)
+        with patch("mirror_mirage.providers.gcp.service_account") as mock_sa:
+            creds = MagicMock()
+            creds.token = "tok"
+            creds.expired = False
+            mock_sa.Credentials.from_service_account_file.return_value = creds
+            async with httpx.AsyncClient() as client:
+                p = GcpCdnProvider(
+                    project="alma-prod",
+                    url_map="alma-prod-lb",
+                    service_account_file=gcp_sa_file,
+                    client=client,
+                )
+                result = await p.purge(["https://cdn-eu.almalinux.org/almalinux/9/x.rpm"])
+        assert result.ok is False
+        assert result.retryable is False
+
+    async def test_limiter_stamps_each_call_when_sent(self, gcp_sa_file: Path) -> None:
+        """Quota slots are taken just before each request, not up front.
+
+        With concurrency 1 and slow responses, requests go out one at a
+        time. Each limiter timestamp must sit right before its request;
+        stamping the whole batch at the start would put later stamps a
+        full response-latency (or more) ahead of their requests.
+        """
+        import asyncio
+
+        latency = 0.1
+        loop = asyncio.get_running_loop()
+        sent_at: list[float] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            sent_at.append(loop.time())
+            await asyncio.sleep(latency)
+            return httpx.Response(200, json={"status": "DONE"})
+
+        with patch("mirror_mirage.providers.gcp.service_account") as mock_sa:
+            creds = MagicMock()
+            creds.token = "tok"
+            creds.expired = False
+            mock_sa.Credentials.from_service_account_file.return_value = creds
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                p = GcpCdnProvider(
+                    project="alma-prod",
+                    url_map="alma-prod-lb",
+                    service_account_file=gcp_sa_file,
+                    client=client,
+                    concurrency=1,
+                )
+                result = await p.purge([f"https://cdn.example/{i}" for i in range(3)])
+
+        assert result.ok is True
+        stamps = sorted(p._get_limiter()._calls)
+        assert len(stamps) == len(sent_at) == 3
+        gaps = [sent - stamp for stamp, sent in zip(stamps, sorted(sent_at), strict=True)]
+        assert all(gap < latency / 2 for gap in gaps), f"stamp-to-send gaps: {gaps}"
+
 
 # ---------------------------------------------------------------------------
 # Dry-run provider

@@ -47,9 +47,9 @@ class TestModelParsing:
         cdn = GcpCdnConfig.model_validate({"type": "gcp_cdn", "project": "p", "url_map": "u"})
         assert cdn.project == "p"
 
-    def test_gcp_quota_defaults_to_500(self) -> None:
+    def test_gcp_quota_defaults_to_450(self) -> None:
         cdn = GcpCdnConfig.model_validate({"type": "gcp_cdn", "project": "p", "url_map": "u"})
-        assert cdn.quota_per_minute == 500
+        assert cdn.quota_per_minute == 450
 
     def test_gcp_quota_can_be_overridden(self) -> None:
         cdn = GcpCdnConfig.model_validate(

@@ -102,7 +102,7 @@ cdns:
     type: gcp_cdn
     project: almalinux-prod
     url_map: alma-prod-lb
-    quota_per_minute: 500   # client-side pacing; default matches GCP's default quota
+    quota_per_minute: 450   # client-side pacing; default leaves headroom under GCP's 500/min quota
 
 # Each watch is a filesystem root. When something changes inside it, every
 # binding listed produces one CDN purge. url_prefix is concatenated with the

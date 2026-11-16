@@ -98,11 +98,14 @@ API calls.
   refreshed automatically before expiry.
 - **Config required:** `project` (GCP project ID), `url_map` (the load
   balancer URL map that fronts the CDN).
-- **Config optional:** `quota_per_minute` (default `500`) — client-side
+- **Config optional:** `quota_per_minute` (default `450`) — client-side
   cap on invalidation requests per rolling minute. Mirror Mirage will block
   excess requests until the window has room, instead of letting GCP
-  reject them with `429`. Raise this only if your project has an
-  elevated quota.
+  reject them with `429`. Each call takes its slot just before it is
+  sent, but the default still sits below GCP's 500/minute quota because
+  the client-side window and GCP's own count never line up exactly.
+  Raise this only if your project has an elevated quota, and keep
+  similar headroom.
 - **API used:** `compute.urlMaps.invalidateCache` —
   `POST https://compute.googleapis.com/compute/v1/projects/{project}/global/urlMaps/{url_map}/invalidateCache`
   with body `{"path": "/foo/bar", "host": "cdn.example.com"}`.
@@ -115,14 +118,18 @@ API calls.
   already invalidated.
 - **Quota:** GCP enforces invalidation quotas per project; default is
   500 paths/minute (overridable in the Cloud Console). Mirror Mirage paces
-  itself client-side via ``quota_per_minute`` to stay under this cap.
-  As a backstop, `429`/`RESOURCE_EXHAUSTED` responses are still treated
-  as retryable, but in normal operation the daemon should never trip
-  them.
-- **Retryable errors:** `429`, `500`, `503`, `RESOURCE_EXHAUSTED`,
-  transport errors.
+  itself client-side via ``quota_per_minute`` (default 450) to stay
+  under this cap.
+  As a backstop, rate-limit responses (`429`, or a `403` carrying a
+  rate-limit reason) are still treated as retryable, but in normal
+  operation the daemon should rarely trip them.
+- **Retryable errors:** `429`, `500`, `503`, transport errors, and `403`
+  when the error body shows rate limiting: status `RESOURCE_EXHAUSTED`,
+  or reason `rateLimitExceeded`, `userRateLimitExceeded` or
+  `RATE_LIMIT_EXCEEDED` (in `error.errors[]` or an `ErrorInfo` detail).
 - **Terminal errors:** `401`/`UNAUTHENTICATED` (rotate the service
-  account), `403`/`PERMISSION_DENIED`, `404` (unknown URL map), `400`.
+  account), any other `403` (e.g. `PERMISSION_DENIED`), `404` (unknown
+  URL map), `400`.
 - **Upstream docs:** <https://cloud.google.com/cdn/docs/invalidating-cached-content>
 
 ## Adding a new provider

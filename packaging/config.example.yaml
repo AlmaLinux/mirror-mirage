@@ -20,9 +20,9 @@ cdns:
     project: your-project
     url_map: your-cdn-url-map
     # Client-side pacing — keeps the daemon under GCP's default quota of
-    # 500 invalidations/minute. Raise only if your project has a higher
-    # quota approved.
-    quota_per_minute: 500
+    # 500 invalidations/minute, with some headroom. Raise only if your
+    # project has a higher quota approved.
+    quota_per_minute: 450
 
 watches:
   # Replace these paths and URL prefixes with the mirror trees and CDN

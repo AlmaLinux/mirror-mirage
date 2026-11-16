@@ -61,10 +61,11 @@ class GcpCdnConfig(BaseModel):
 
     ``quota_per_minute`` enforces a client-side cap on invalidation
     requests so that Mirage does not exceed the project's per-minute
-    invalidation quota. The default of 500 matches GCP's default quota
-    of 500 paths/minute; raise this if your project has an elevated
-    quota. Mirage blocks (does not drop) excess work, so a burst above
-    quota is paced out across subsequent minutes.
+    invalidation quota. The default of 450 leaves headroom under GCP's
+    default quota of 500 paths/minute, because the client-side window
+    and GCP's own count never line up exactly; raise this if your
+    project has an elevated quota. Mirage blocks (does not drop) excess
+    work, so a burst above quota is paced out across subsequent minutes.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -72,7 +73,7 @@ class GcpCdnConfig(BaseModel):
     type: Literal["gcp_cdn"]
     project: str
     url_map: str
-    quota_per_minute: int = 500
+    quota_per_minute: int = 450
 
 
 CdnConfig = Annotated[
