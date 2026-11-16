@@ -168,6 +168,53 @@ class TestEndToEnd:
             ]
         ]
 
+    async def test_unlink_then_relink_purges_link_tree(
+        self, basic_config: Config, mirror_tree: Path, monkeypatch
+    ) -> None:
+        """``rm 10 && ln -s 10.3 10``: the new link's creation triggers the purge."""
+        for version in ("10.2", "10.3"):
+            (mirror_tree / version).mkdir()
+        (mirror_tree / "10").symlink_to("10.2")
+
+        recorders = {
+            "fastly_main": RecordingProvider("fastly_main"),
+            "cloudfront_us": RecordingProvider("cloudfront_us"),
+        }
+
+        def fake_build(cfg, *, dry_run=False):
+            return dict(recorders)
+
+        monkeypatch.setattr("mirror_mirage.daemon.build_providers", fake_build, raising=False)
+        monkeypatch.setattr("mirror_mirage.providers.build_providers", fake_build, raising=False)
+
+        task = asyncio.create_task(daemon_run(basic_config))
+        try:
+            await asyncio.sleep(0.2)
+            (mirror_tree / "10").unlink()
+            await asyncio.sleep(0.05)
+            (mirror_tree / "10").symlink_to("10.3")
+            for _ in range(40):  # up to 2 s
+                if all(r.batches for r in recorders.values()):
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert recorders["fastly_main"].batches == [
+            [
+                "https://repo.almalinux.org/almalinux/10",
+                "https://repo.almalinux.org/almalinux/10/*",
+            ]
+        ]
+        assert recorders["cloudfront_us"].batches == [
+            [
+                "https://cdn-us.almalinux.org/almalinux/10",
+                "https://cdn-us.almalinux.org/almalinux/10/*",
+            ]
+        ]
+
     async def test_staging_writes_do_not_purge(
         self, basic_config: Config, mirror_tree: Path, monkeypatch
     ) -> None:

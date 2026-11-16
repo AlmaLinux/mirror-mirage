@@ -107,7 +107,9 @@ pruned.
 
 When a version symlink is retargeted (`9 -> 9.8` becomes `9 -> 9.9`), every
 binding on the watch queues the link's own URL plus a wildcard for
-everything under it:
+everything under it. The trigger is the new link appearing, so it works
+the same whether the old link is removed first (`rm 9 && ln -s 9.9 9`) or
+replaced in one step (`ln -sfn 9.9 9`, rsync):
 
 ```
 https://repo.example.org/almalinux/9
@@ -130,9 +132,12 @@ Two things to keep in mind:
 - **Flip after the target is complete.** The purge goes out within about
   `batch_quiet_window_seconds` of the flip. If `9.9` is still being synced,
   CDNs can re-cache the incomplete tree (including 404s) under `/9/`.
-- **Deleting a link is not a tree purge.** With `flush_on_delete: true`, a
-  removed symlink is purged as a single URL, because once it is gone there
-  is no way to tell it pointed at a directory. Retargeting is unaffected.
+- **Removing a link on its own does not purge the tree.** The purge comes
+  from creating the new link. With `flush_on_delete: true`, the removal
+  purges only the link's own URL, because once it is gone there is no way
+  to tell it pointed at a directory. Between `rm` and `ln -s`, the origin
+  returns 404s under `/9/`; CDNs may cache those briefly, and the purge
+  for the new link clears them.
 
 ## Common failures
 
