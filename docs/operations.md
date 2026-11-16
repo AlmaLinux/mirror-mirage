@@ -171,6 +171,46 @@ a bind mount). A directory *moved* into a watch root, rather than created
 there, is not watched, so neither its files nor its links are tracked until
 the daemon restarts; that predates alias support.
 
+## Edge aliases (Fastly)
+
+See [cdn-providers.md](cdn-providers.md#fastly-edge-aliases) for what
+`edge_aliases` does and the one-time Fastly setup.
+
+Preview, without writing anything:
+
+```sh
+# Items the rules produce from the current tree, as rule<TAB>alias<TAB>real
+sudo -u mirror-mirage mirror-mirage --config /etc/mirror-mirage/config.yaml \
+  --edge-aliases show
+# What a sync would change in the live dictionary (+ add, ~ change, - delete)
+sudo -u mirror-mirage mirror-mirage --config /etc/mirror-mirage/config.yaml \
+  --edge-aliases diff --cdn fastly_main
+```
+
+Use `show` to try a new rule before deploying it. After a restart, a
+successful sync logs at INFO when it changed something (and once at
+startup):
+
+```sh
+journalctl -u mirror-mirage -g 'event=edge_aliases_'
+```
+
+- `event=edge_aliases_synced ... items=N upserts=U deletes=D` — normal.
+  Check the `skipped_<reason>=N` fields when an expected path is missing.
+- `event=edge_aliases_sync_failed ... error='...'` — retried with backoff.
+  `not found on active version` means the dictionary is missing from the
+  active service version; `HTTP 401`/`403` means the token lacks `global`
+  scope on the service; `exceed max_items` means the rules match too much.
+
+Point releases: when `10 -> 10.4` flips, every rule-covered `/10/` item is
+repointed in one sync, so those URLs need no manual purge. URLs outside
+the rules still behave as described under
+[Release symlink flips](#release-symlink-flips).
+
+To turn the feature off, remove `edge_aliases` and restart, then remove
+the VCL snippet (or empty the dictionary) on the Fastly side. Mirror
+Mirage does not clear the dictionary when the block is removed.
+
 ## Common failures
 
 ### Daemon won't start: "secrets file has insecure permissions"

@@ -9,6 +9,17 @@ cdns:
   fastly_main:
     type: fastly
     service_id: XXX   # your Fastly service ID
+    # Optional: publish alias -> real path items for these URL paths to an
+    # edge dictionary, for a VCL snippet that rewrites req.url so every
+    # symlink alias of a file shares one cache entry. Needs a global-scope
+    # token restricted to this service, plus a one-time dictionary and
+    # snippet on the service: see docs/cdn-providers.md#fastly-edge-aliases.
+    # edge_aliases:
+    #   dictionary: mirage_aliases
+    #   rules:
+    #     - name: isos
+    #       match: "example-distro/*/isos/*/*.iso"
+    #   max_items: 1000
 
   cloudfront_us:
     type: cloudfront

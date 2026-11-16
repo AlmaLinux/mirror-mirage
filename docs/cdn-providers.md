@@ -56,6 +56,8 @@ Providers handle the wildcard according to what the CDN supports:
   - `global:read` (or wider) *additionally* when
     `purge_all_service_domains` is enabled — needed so the daemon can
     call `GET /service/{id}` and list the active version's domains.
+  - `global` when `edge_aliases` is configured, to write dictionary items
+    (see [Fastly edge aliases](#fastly-edge-aliases)).
 - **Config required:** `service_id` — recorded for operator clarity
   (which CDN binding maps to which Fastly service); the URL-purge API
   itself does not require it in the request.
@@ -91,6 +93,117 @@ Providers handle the wildcard according to what the CDN supports:
 - **Terminal status codes:** `400` (malformed URL), `401` (bad token —
   fix credentials), `403`, `404` (URL not part of this service).
 - **Upstream docs:** <https://www.fastly.com/documentation/reference/api/purging/>
+
+## Fastly edge aliases
+
+Optional, per Fastly CDN. A file reachable through symlinks has several
+URLs (`/almalinux/10/...` when `10 -> 10.3`, `-latest-` names), and Fastly
+caches each one separately. With `edge_aliases`, Mirror Mirage keeps an
+edge dictionary of **alias URL path → real URL path** for the URL paths
+your rules select, and a VCL snippet rewrites `req.url` with it. All the
+aliases of a file then share the real path's cache entry:
+
+- one cached copy of each file, not one per alias;
+- every cached object is a real file, so the normal purge of the real path
+  keeps it fresh (a re-spin in place needs nothing extra);
+- retargeting a `-latest-` link or a version link is a dictionary update
+  (seconds), not a purge. Nothing is fetched cold that did not change.
+
+```yaml
+cdns:
+  fastly_main:
+    type: fastly
+    service_id: SU1Z0isxPaozGVKXdv0eY
+    edge_aliases:
+      dictionary: mirage_aliases
+      rules:
+        - name: isos
+          match: "almalinux/*/isos/*/*.iso"
+        - name: cloud-images
+          match: "almalinux/*/cloud/*/images/*"
+      # max_items: 1000               # refuse to sync more than this
+      # settle_seconds: 5             # quiet time after a change before syncing
+      # resync_interval_seconds: 600  # full resync period
+```
+
+`match` is a glob over the URL path without the leading slash, with the
+same syntax as `ignore` globs. Rules only say *which* URL paths to look
+at; where each one points comes from the symlinks on disk. A path becomes
+an item when it reaches a regular file through at least one symlink and
+that file is served through a binding of the same CDN. Prefer anchored
+patterns: a leading `**` walks the whole tree on every sync.
+
+### Fastly setup (once)
+
+1. Create the edge dictionary (`mirage_aliases` above) on a new service
+   version. It must not be write-only: Mirror Mirage reads it to compute
+   the diff.
+2. Add a VCL snippet on the same version:
+
+```vcl
+# Type: recv. Give it a lower priority number than any other recv snippet
+# that reads req.url, so the rewrite happens first.
+if (table.contains(mirage_aliases, req.url.path)) {
+  set req.http.Mirage-Alias = req.url.path;
+  if (req.url.qs == "") {
+    set req.url = table.lookup(mirage_aliases, req.url.path);
+  } else {
+    set req.url = table.lookup(mirage_aliases, req.url.path) "?" req.url.qs;
+  }
+}
+```
+
+   The rewrite applies to every domain on the service. If the service
+   also serves hosts whose paths mean something else, wrap the snippet
+   in a `req.http.host` check. It is idempotent (a real path is never a
+   key), so the shield hop, restarts and segmented-caching inner
+   requests are unaffected. `Mirage-Alias` keeps the requested path for
+   logging.
+3. Activate the version. The dictionary is empty, so nothing changes yet.
+4. Give the CDN's `api_token` `global` scope. Writing dictionary items
+   needs it (Fastly has no narrower scope that can), so restrict the
+   token to this one service. Don't share it with CDNs on other services.
+
+### Rollout
+
+1. Deploy the config, then preview without writing anything:
+   `mirror-mirage --config ... --edge-aliases show` (the items the rules
+   produce) and `--edge-aliases diff` (against the live dictionary).
+2. Restart the daemon. It syncs at startup, logs
+   `event=edge_aliases_synced ... upserts=N`, and the rewrites start.
+
+### Sync behavior
+
+- **Desired state, not a log.** Each sync recomputes the whole mapping from
+  the filesystem (glob expansion following symlinks, then `realpath`),
+  reads the live dictionary, and applies the difference in batches of up
+  to 1000 operations. A missed event is corrected at the next sync.
+- **Triggers:** startup; any symlink change; any purge whose URL matches a
+  rule (a new image appearing under `10.3/` adds a `/10/` item), debounced
+  by `settle_seconds` (at most 60 s); and every `resync_interval_seconds`.
+- **Ownership:** the dictionary belongs to Mirror Mirage. Items it did not
+  write are deleted at the next sync.
+- **Safety:** an item is only published when its target exists, is a
+  regular file, and is under a watch bound to the same CDN. A missing or
+  broken tree removes items, which falls back to un-rewritten URLs
+  (today's behavior) rather than rewriting to the wrong file. A mapping
+  larger than `max_items` is not written at all.
+- **Skipped paths** are counted in the sync log line
+  (`skipped_<reason>=N`): `outside_watches` (the link resolves outside
+  every watch, e.g. an absolute target through a bind mount's device
+  path), `target_not_on_cdn`, `target_ignored`, `not_a_file`,
+  `needs_url_encoding`, `too_long` (keys are capped at 255 characters,
+  values at 8000), `conflict`.
+- **Failures** (`event=edge_aliases_sync_failed`) are retried with
+  backoff from 5 s to 5 min. They never affect purging.
+- **Dry run:** with `--dry-run` the sync computes the mapping and logs
+  `event=edge_aliases_dry_run items=N` without calling Fastly.
+- **API used:** `GET /service/{id}` (active version),
+  `GET /service/{id}/version/{v}/dictionary/{name}` (dictionary ID),
+  `GET` and `PATCH /service/{id}/dictionary/{dict_id}/items`.
+
+Purging is unchanged: alias URLs are still purged when `purge_aliases` is
+on.
 
 ## AWS CloudFront
 

@@ -21,6 +21,7 @@ from mirror_mirage.config import (
     Config,
     ConfigError,
     DaemonConfig,
+    EdgeAliasesConfig,
     FastlyCdn,
     GcpCdnConfig,
     WatchConfig,
@@ -276,4 +277,63 @@ class TestLoadFailures:
         sec_path.write_text("{}\n")
         os.chmod(sec_path, 0o600)
         with pytest.raises(ConfigError):
+            load(cfg_path, sec_path)
+
+
+class TestEdgeAliasesConfig:
+    def _fastly(self, edge: dict) -> FastlyCdn:
+        return FastlyCdn.model_validate({"type": "fastly", "service_id": "s", "edge_aliases": edge})
+
+    def test_parses_with_defaults(self) -> None:
+        cdn = self._fastly(
+            {"dictionary": "mirage_aliases", "rules": [{"name": "isos", "match": "a/*/*.iso"}]}
+        )
+        assert isinstance(cdn.edge_aliases, EdgeAliasesConfig)
+        assert cdn.edge_aliases.max_items == 1000
+        assert cdn.edge_aliases.resync_interval_seconds == 600
+
+    def test_off_by_default(self) -> None:
+        assert FastlyCdn(type="fastly", service_id="s").edge_aliases is None
+
+    def test_leading_slash_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="leading slash"):
+            self._fastly({"dictionary": "d", "rules": [{"name": "r", "match": "/a/*"}]})
+
+    def test_duplicate_rule_names_rejected(self) -> None:
+        rules = [{"name": "r", "match": "a/*"}, {"name": "r", "match": "b/*"}]
+        with pytest.raises(ValidationError, match="duplicate"):
+            self._fastly({"dictionary": "d", "rules": rules})
+
+    def test_rules_required(self) -> None:
+        with pytest.raises(ValidationError):
+            self._fastly({"dictionary": "d", "rules": []})
+
+    def test_unbound_cdn_rejected_at_load(self, tmp_path: Path, mirror_tree: Path) -> None:
+        cfg_path = tmp_path / "config.yaml"
+        sec_path = tmp_path / "secrets.yaml"
+        _write(
+            cfg_path,
+            {
+                "cdns": {
+                    "fastly_main": {"type": "fastly", "service_id": "x"},
+                    "fastly_edge": {
+                        "type": "fastly",
+                        "service_id": "y",
+                        "edge_aliases": {"dictionary": "d", "rules": [{"name": "r", "match": "*"}]},
+                    },
+                },
+                "watches": [
+                    {
+                        "path": str(mirror_tree),
+                        "bindings": [{"cdn": "fastly_main", "url_prefix": "https://x/"}],
+                    }
+                ],
+            },
+        )
+        _write(
+            sec_path,
+            {"fastly_main": {"api_token": "x"}, "fastly_edge": {"api_token": "y"}},
+            mode=0o600,
+        )
+        with pytest.raises(ConfigError, match="no watch binds it"):
             load(cfg_path, sec_path)

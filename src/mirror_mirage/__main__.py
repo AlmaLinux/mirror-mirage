@@ -5,9 +5,14 @@ Usage::
     mirror-mirage --config /etc/mirror-mirage/config.yaml
                   [--secrets /etc/mirror-mirage/secrets.yaml]
                   [--check] [--dry-run]
+                  [--edge-aliases {show,diff} [--cdn NAME]]
 
 * ``--check`` validates config and exits.
 * ``--dry-run`` runs the daemon but skips real CDN API calls.
+* ``--edge-aliases show`` prints the alias → real path items each Fastly
+  CDN's ``edge_aliases`` rules produce from the current tree, and
+  ``--edge-aliases diff`` compares them with the live dictionary. Both
+  exit without starting the daemon; neither writes anything.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import signal
 import sys
 from pathlib import Path
 
-from mirror_mirage import daemon
+from mirror_mirage import daemon, edge_aliases
 from mirror_mirage import logging as mirror_mirage_logging
 from mirror_mirage.config import Config, ConfigError, load
 from mirror_mirage.watcher import InotifyLimitError
@@ -46,6 +51,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="log intended purges without calling any CDN API",
     )
+    parser.add_argument(
+        "--edge-aliases",
+        choices=["show", "diff"],
+        help=(
+            "print the edge dictionary items the edge_aliases rules produce (show) "
+            "or their difference from the live Fastly dictionary (diff), then exit"
+        ),
+    )
+    parser.add_argument("--cdn", help="limit --edge-aliases to this CDN")
     parser.add_argument(
         "-v",
         "--verbose",
@@ -84,6 +98,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         print("mirror-mirage: config OK")
         return 0
+
+    if args.edge_aliases:
+        return asyncio.run(
+            edge_aliases.report(
+                cfg, mode=args.edge_aliases, cdn=args.cdn, out=sys.stdout, err=sys.stderr
+            )
+        )
 
     try:
         asyncio.run(_run(cfg, dry_run=args.dry_run))

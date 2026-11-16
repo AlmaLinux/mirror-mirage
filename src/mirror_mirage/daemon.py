@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from mirror_mirage.batcher import Batcher
 from mirror_mirage.config import Config, RetryConfig
+from mirror_mirage.edge_aliases import EdgeAliasSync, build_edge_syncs
 from mirror_mirage.filter import EventFilter
 from mirror_mirage.mapper import Mapper
 from mirror_mirage.providers import build_providers
@@ -165,18 +166,27 @@ async def _pipeline(
     mapper: Mapper,
     batcher: Batcher,
     symlinks: SymlinkIndex,
+    edge_syncs: dict[str, EdgeAliasSync] | None = None,
 ) -> None:
     """Pump inotify events through filter → mapper → batcher.
 
     Every event updates the symlink index first, before the filter can
-    drop it, so the mapper's alias lookups see the current links.
+    drop it, so the mapper's alias lookups see the current links. A link
+    change, or a purge target whose URL matches a CDN's edge alias rules,
+    also asks that CDN's edge dictionary sync to run.
     """
+    edge_syncs = edge_syncs or {}
     async for mask_name, abs_path, _watch_root in watcher:
-        symlinks.observe(mask_name, abs_path)
+        if symlinks.observe(mask_name, abs_path):
+            for sync in edge_syncs.values():
+                sync.notify()
         event = filter_.normalize(mask_name, abs_path)
         if event is None:
             continue
         for target in mapper.map(event):
+            cdn_sync = edge_syncs.get(target.cdn_name)
+            if cdn_sync is not None and cdn_sync.wants(target.url):
+                cdn_sync.notify()
             await batcher.submit(target)
 
 
@@ -202,14 +212,16 @@ async def run(cfg: Config, *, dry_run: bool = False) -> None:
             max_aliases=cfg.daemon.max_aliases_per_event,
         )
         filter_ = EventFilter(cfg.watches)
+        edge_syncs = build_edge_syncs(cfg, dry_run=dry_run)
 
         async with InotifyWatcher(cfg.watches, symlinks=symlinks) as watcher:
             _log.info(
-                "event=ready dry_run=%s watches=%d cdns=%d symlinks=%d",
+                "event=ready dry_run=%s watches=%d cdns=%d symlinks=%d edge_alias_cdns=%d",
                 dry_run,
                 len(cfg.watches),
                 len(providers),
                 len(symlinks),
+                len(edge_syncs),
             )
             async with asyncio.TaskGroup() as tg:
                 for cdn_name, provider in providers.items():
@@ -217,9 +229,11 @@ async def run(cfg: Config, *, dry_run: bool = False) -> None:
                         _queue_worker(queue, cdn_name, provider, cfg.daemon.retry),
                         name=f"mirror-mirage-worker-{cdn_name}",
                     )
+                for cdn_name, sync in edge_syncs.items():
+                    tg.create_task(sync.run(), name=f"mirror-mirage-edge-aliases-{cdn_name}")
                 tg.create_task(batcher.run(), name="mirror-mirage-batcher")
                 tg.create_task(
-                    _pipeline(watcher, filter_, mapper, batcher, symlinks),
+                    _pipeline(watcher, filter_, mapper, batcher, symlinks, edge_syncs),
                     name="mirror-mirage-pipeline",
                 )
     finally:

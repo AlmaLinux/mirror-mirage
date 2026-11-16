@@ -23,7 +23,66 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+
+class EdgeAliasRule(BaseModel):
+    """One rule selecting alias URLs to rewrite at the edge.
+
+    ``match`` is a glob over the URL path without the leading slash
+    (``almalinux/*/isos/*/*.iso``), with the same syntax as ``ignore``
+    globs: ``*`` matches within one path component and ``**`` matches any
+    number of components. ``name`` labels the rule in logs and CLI output.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    match: str = Field(min_length=1)
+
+    @field_validator("match")
+    @classmethod
+    def _no_leading_slash(cls, value: str) -> str:
+        if value.startswith("/"):
+            raise ValueError("match is a URL path glob without the leading slash")
+        return value
+
+
+class EdgeAliasesConfig(BaseModel):
+    """Publish symlink alias → real path mappings to a Fastly edge dictionary.
+
+    Every URL path that matches a rule and reaches a real file through at
+    least one symlink becomes one dictionary item, alias path → real path.
+    A VCL snippet on the service rewrites ``req.url`` with it, so all the
+    alias URLs of a file share the real path's cache entry. See
+    ``docs/cdn-providers.md`` for the Fastly-side setup.
+
+    * ``dictionary`` — name of the edge dictionary on the active service
+      version. Mirror Mirage owns its contents: items it did not write
+      are deleted.
+    * ``max_items`` — refuse to sync a mapping larger than this (Fastly's
+      default dictionary limit is 1000 items).
+    * ``settle_seconds`` — after a relevant change, wait until changes
+      have stopped for this long (at most 60 s) before syncing.
+    * ``resync_interval_seconds`` — full resync period, which also catches
+      anything a missed event would have changed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dictionary: str = Field(min_length=1)
+    rules: list[EdgeAliasRule] = Field(min_length=1)
+    max_items: int = Field(default=1000, ge=1)
+    settle_seconds: float = Field(default=5.0, ge=0)
+    resync_interval_seconds: float = Field(default=600.0, gt=0)
+
+    @model_validator(mode="after")
+    def _unique_rule_names(self) -> EdgeAliasesConfig:
+        names = [r.name for r in self.rules]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(f"duplicate edge alias rule names: {dupes}")
+        return self
 
 
 class FastlyCdn(BaseModel):
@@ -37,6 +96,10 @@ class FastlyCdn(BaseModel):
     file. The API token must include ``global:read`` (or wider) scope in
     addition to ``purge_select`` for discovery to succeed; most
     automation tokens already have this.
+
+    ``edge_aliases`` turns on edge dictionary sync (see
+    :class:`EdgeAliasesConfig`). Writing dictionary items needs a token
+    with ``global`` scope; restrict it to this one service.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -44,6 +107,7 @@ class FastlyCdn(BaseModel):
     type: Literal["fastly"]
     service_id: str
     purge_all_service_domains: bool = False
+    edge_aliases: EdgeAliasesConfig | None = None
 
 
 class CloudFrontCdn(BaseModel):
@@ -176,6 +240,7 @@ def load(config_path: Path, secrets_path: Path) -> Config:
     * A binding referencing a CDN not defined under ``cdns:``
     * A CDN with no entry in ``secrets.yaml``
     * A ``watches[].path`` that does not exist on disk
+    * A Fastly CDN with ``edge_aliases`` that no watch binds
     """
     # Mode check first — refuse to even read a world-readable secrets file.
     try:
@@ -224,6 +289,14 @@ def load(config_path: Path, secrets_path: Path) -> Config:
                     f"watch {watch.path}: binding references unknown cdn "
                     f"{binding.cdn!r}; defined cdns: {sorted(cdn_names)}"
                 )
+
+    bound_cdns = {b.cdn for w in cfg.watches for b in w.bindings}
+    for cdn_name, cdn in cfg.cdns.items():
+        if isinstance(cdn, FastlyCdn) and cdn.edge_aliases and cdn_name not in bound_cdns:
+            raise ConfigError(
+                f"cdn {cdn_name!r} has edge_aliases but no watch binds it, "
+                f"so there are no paths to publish"
+            )
 
     for cdn_name in cfg.cdns:
         creds = secrets_data.get(cdn_name)

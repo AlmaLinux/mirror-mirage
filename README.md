@@ -37,6 +37,9 @@ change before the first stable release.
 - Alias-aware: a change to a file also purges the other URLs that reach it
   through symlinks — `9/...` when `9 -> 9.9`, and `-latest-` names that
   point at it — so every cached copy is refreshed, not just the real path.
+- Optional Fastly edge aliases: an edge dictionary, kept in sync with the
+  symlinks on disk, lets a VCL snippet serve every alias of a file from the
+  real path's cache entry. Rules select which URLs take part.
 - Per-CDN debouncing and bulk batching to minimize CDN API calls.
 - SQLite-backed persistent job queue: in-flight and failed flushes survive
   daemon restarts.
@@ -98,6 +101,14 @@ cdns:
   fastly_main:
     type: fastly
     service_id: SU1Z0isxPaozGVKXdv0eY
+    # Optional: keep a Fastly edge dictionary of alias -> real path for these
+    # URL paths, for a VCL snippet that rewrites req.url with it. Needs a
+    # global-scope token. See docs/cdn-providers.md#fastly-edge-aliases.
+    edge_aliases:
+      dictionary: mirage_aliases
+      rules:
+        - name: isos
+          match: "almalinux/*/isos/*/*.iso"
 
   cloudfront_us:
     type: cloudfront
@@ -181,6 +192,17 @@ mirror-mirage --config /etc/mirror-mirage/config.yaml --check
 ```
 
 Exits 0 on a valid config, non-zero with a diagnostic on the first problem.
+
+### Previewing edge aliases
+
+```sh
+mirror-mirage --config /etc/mirror-mirage/config.yaml --edge-aliases show
+mirror-mirage --config /etc/mirror-mirage/config.yaml --edge-aliases diff [--cdn fastly_main]
+```
+
+`show` prints the dictionary items the `edge_aliases` rules produce from the
+current tree; `diff` compares them with the live Fastly dictionary. Neither
+writes anything.
 
 ### Dry-run / debug mode
 

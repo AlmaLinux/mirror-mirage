@@ -52,6 +52,12 @@ top-level [README](../README.md).
                   CDN APIs
 ```
 
+Alongside the pipeline, for Fastly CDNs with `edge_aliases`:
+
+```
+  symlink change / matching purge ──notify──► EdgeAliasSync ──diff──► Fastly edge dictionary
+```
+
 A single asyncio event loop drives everything. There are no worker threads
 except those `asyncio.to_thread` spawns for blocking boto3 calls.
 
@@ -245,6 +251,29 @@ class CdnProvider(Protocol):
 
 `PurgeResult` is a small dataclass: `ok`, `retryable`, `message`. See
 [cdn-providers.md](cdn-providers.md) for per-CDN details.
+
+### `edge_aliases.py` — Fastly edge dictionary sync
+
+Optional, for Fastly CDNs with `edge_aliases`. Publishes alias URL path →
+real URL path items to an edge dictionary that a VCL snippet uses to
+rewrite `req.url`, so a file's aliases share one cache entry (see
+[cdn-providers.md](cdn-providers.md#fastly-edge-aliases)).
+
+`compute_mapping()` is the whole model: for each binding of the CDN,
+expand each rule against the tree (following symlinks; hidden names and
+nested watch roots skipped; `**` guarded against loops), `realpath` each
+match, and keep it if that differs from the path itself and lands on a
+regular file under a watch bound to the same CDN. It does not use the
+symlink index or any event history, so it can run at any time and gives
+the same answer for the same tree.
+
+`EdgeAliasSync` runs one loop per CDN in the daemon's task group: compute
+the mapping in a thread, read the live dictionary, apply the diff
+(`providers/fastly_dictionary.py`). The pipeline calls `notify()` when the
+symlink index changes or a purge target matches a rule; the loop waits for
+`settle_seconds` of quiet (at most 60 s) and syncs. It also resyncs every
+`resync_interval_seconds`. Errors are caught, logged and retried with
+backoff, so a dictionary problem never stops purging.
 
 ### `config.py` — config loading
 

@@ -15,10 +15,11 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
-from mirror_mirage.config import Config
+from mirror_mirage.config import Config, EdgeAliasesConfig, EdgeAliasRule, FastlyCdn
 from mirror_mirage.daemon import run as daemon_run
 from mirror_mirage.providers.base import PurgeResult
 
@@ -330,3 +331,75 @@ class TestSymlinkAliases:
                 "AlmaLinux-10-latest-x86_64-dvd.iso",
             ]
         ]
+
+
+class _FakeDictionaryClient:
+    """Replaces FastlyDictionaryClient; one shared dict per test."""
+
+    data: ClassVar[dict[str, str]] = {}
+
+    def __init__(self, **_kwargs) -> None:
+        pass
+
+    async def items(self) -> dict[str, str]:
+        return dict(self.data)
+
+    async def apply(self, ops: list[dict[str, str]]) -> None:
+        for op in ops:
+            if op["op"] == "delete":
+                self.data.pop(op["item_key"], None)
+            else:
+                self.data[op["item_key"]] = op["item_value"]
+
+    async def aclose(self) -> None:
+        pass
+
+
+class TestEdgeAliases:
+    async def test_latest_retarget_updates_dictionary(
+        self, basic_config: Config, mirror_tree: Path, monkeypatch
+    ) -> None:
+        iso_dir = mirror_tree / "10.3/isos/x86_64"
+        iso_dir.mkdir(parents=True)
+        (iso_dir / "AlmaLinux-10.3-x86_64-dvd.iso").write_bytes(b"spin 1")
+        (iso_dir / "AlmaLinux-10.3-1-x86_64-dvd.iso").write_bytes(b"spin 2")
+        (iso_dir / "AlmaLinux-10-latest-x86_64-dvd.iso").symlink_to("AlmaLinux-10.3-x86_64-dvd.iso")
+        (mirror_tree / "10").symlink_to("10.3")
+
+        edge = EdgeAliasesConfig(
+            dictionary="mirage_aliases",
+            rules=[EdgeAliasRule(name="isos", match="almalinux/*/isos/*/*.iso")],
+            settle_seconds=0.05,
+        )
+        fastly = basic_config.cdns["fastly_main"]
+        assert isinstance(fastly, FastlyCdn)
+        cfg = basic_config.model_copy(
+            update={
+                "cdns": {
+                    **basic_config.cdns,
+                    "fastly_main": fastly.model_copy(update={"edge_aliases": edge}),
+                }
+            }
+        )
+        monkeypatch.setattr(_FakeDictionaryClient, "data", {})
+        monkeypatch.setattr(
+            "mirror_mirage.edge_aliases.FastlyDictionaryClient", _FakeDictionaryClient
+        )
+        latest_key = "/almalinux/10/isos/x86_64/AlmaLinux-10-latest-x86_64-dvd.iso"
+
+        def retarget() -> None:
+            assert _FakeDictionaryClient.data[latest_key] == (
+                "/almalinux/10.3/isos/x86_64/AlmaLinux-10.3-x86_64-dvd.iso"
+            )
+            tmp = iso_dir / ".latest.AbCdEf"
+            tmp.symlink_to("AlmaLinux-10.3-1-x86_64-dvd.iso")
+            os.replace(tmp, iso_dir / "AlmaLinux-10-latest-x86_64-dvd.iso")
+
+        await _run_until_batches(cfg, monkeypatch, retarget)
+        for _ in range(40):
+            if _FakeDictionaryClient.data[latest_key].endswith("10.3-1-x86_64-dvd.iso"):
+                break
+            await asyncio.sleep(0.05)
+        assert _FakeDictionaryClient.data[latest_key] == (
+            "/almalinux/10.3/isos/x86_64/AlmaLinux-10.3-1-x86_64-dvd.iso"
+        )
