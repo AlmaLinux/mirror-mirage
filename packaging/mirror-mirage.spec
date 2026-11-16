@@ -1,7 +1,7 @@
 %global app_module mirror_mirage
 
 Name:           mirror-mirage
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Inotify-driven CDN cache-flush daemon for filesystem mirrors
 
@@ -89,5 +89,16 @@ install -d -m 0755 %{buildroot}%{_sysconfdir}/%{name}
 %dir %{_sysconfdir}/%{name}
 
 %changelog
+* Mon Nov 16 2026 Jonathan Wright <jonathan@almalinux.org> - 0.2.0-1
+- Update to 0.2.0
+- Purge symlink alias URLs (10 -> 10.3, -latest- names) alongside the
+  real path; new purge_aliases and max_aliases_per_event settings
+- Fastly: optional edge_aliases sync of an edge dictionary that a VCL
+  snippet uses to rewrite alias URLs; --edge-aliases show|diff to preview
+- Purge the link and its tree when a directory symlink is retargeted
+- Retry only the URLs that failed, not the whole batch
+- CloudFront: wait out the in-progress invalidation limit
+- GCP: keep the invalidation rate under the 500/min quota
+
 * Thu May 28 2026 Jonathan Wright <jonathan@almalinux.org> - 0.1.0-1
 - Initial package.
