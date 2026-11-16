@@ -98,12 +98,23 @@ CloudFront sends the whole batch in one invalidation, so its result
   `RequestLimitExceeded`, `ServiceUnavailable`, 5xx, transport errors.
 - **Terminal errors:** `AccessDenied` (revoked credentials),
   `NoSuchDistribution`, `InvalidArgument`, `MalformedXML`.
-- **Active-invalidation limit:** AWS allows up to 15 concurrent
-  in-progress invalidations per distribution. Mirror Mirage's worker is
-  single-threaded per distribution so this is not normally hit, but
-  during retry storms the API may reject with
-  `TooManyInvalidationsInProgress` — treated as retryable.
-- **Upstream docs:** <https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Invalidation.html>
+- **Active-invalidation limit:** AWS allows up to 3,000 individual file
+  paths in progress per distribution at once (wildcard paths have a
+  separate cap of 15). `create_invalidation` returns as soon as the
+  invalidation is accepted, not when it finishes, so a large sync
+  reaches this limit quickly: with 500-path batches, six invalidations
+  in progress use it all up. CloudFront then rejects new batches with
+  `TooManyInvalidationsInProgress`. The provider treats that as
+  backpressure, not a failed attempt: it holds the batch and resubmits
+  the same invalidation every 30 seconds until CloudFront accepts it.
+  Each CDN has one queue worker, so this pauses the CloudFront queue
+  without using up any job's retry attempts. It logs
+  `event=cloudfront_in_progress_limit` when the wait starts and
+  `event=cloudfront_in_progress_cleared` when the batch is accepted.
+  After 30 minutes of waiting it gives up and returns a retryable
+  failure, and the normal retry backoff takes over.
+- **Upstream docs:** <https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Invalidation.html>,
+  <https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/InvalidationLimits.html>
 
 ## GCP Cloud CDN
 

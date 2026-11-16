@@ -429,6 +429,64 @@ class TestCloudFrontProvider:
             result = await p.purge(["https://cdn.example.com/a"])
         assert result.ok is False
         assert result.retryable is True
+        # Only the in-progress limit is waited out inside purge().
+        assert client.create_invalidation.call_count == 1
+
+    async def test_in_progress_limit_waits_then_resubmits(self) -> None:
+        from botocore.exceptions import ClientError
+
+        limit = ClientError(
+            {"Error": {"Code": "TooManyInvalidationsInProgress", "Message": "busy"}},
+            "CreateInvalidation",
+        )
+        with patch("mirror_mirage.providers.cloudfront.boto3") as mock_boto:
+            client = MagicMock()
+            mock_boto.client.return_value = client
+            client.create_invalidation.side_effect = [
+                limit,
+                limit,
+                {"Invalidation": {"Id": "I123", "Status": "InProgress"}},
+            ]
+            p = CloudFrontProvider(
+                distribution_id="E1",
+                region="us-east-1",
+                access_key_id="x",
+                secret_access_key="x",
+                in_progress_poll_seconds=0.01,
+                in_progress_max_wait_seconds=5.0,
+            )
+            result = await p.purge(["https://cdn.example.com/a", "https://cdn.example.com/b"])
+        assert result.ok is True
+        assert client.create_invalidation.call_count == 3
+        # Every resubmit is the same invalidation, so CloudFront can never
+        # create it twice.
+        batches = [c.kwargs["InvalidationBatch"] for c in client.create_invalidation.call_args_list]
+        assert all(b == batches[0] for b in batches)
+
+    async def test_in_progress_limit_gives_up_after_max_wait(self) -> None:
+        from botocore.exceptions import ClientError
+
+        limit = ClientError(
+            {"Error": {"Code": "TooManyInvalidationsInProgress", "Message": "busy"}},
+            "CreateInvalidation",
+        )
+        with patch("mirror_mirage.providers.cloudfront.boto3") as mock_boto:
+            client = MagicMock()
+            mock_boto.client.return_value = client
+            client.create_invalidation.side_effect = limit
+            p = CloudFrontProvider(
+                distribution_id="E1",
+                region="us-east-1",
+                access_key_id="x",
+                secret_access_key="x",
+                in_progress_poll_seconds=0.01,
+                in_progress_max_wait_seconds=0.05,
+            )
+            result = await p.purge(["https://cdn.example.com/a"])
+        assert result.ok is False
+        assert result.retryable is True
+        assert result.message.startswith("TooManyInvalidationsInProgress: still at the limit")
+        assert client.create_invalidation.call_count >= 3
 
     async def test_access_denied_is_terminal(self) -> None:
         from botocore.exceptions import ClientError

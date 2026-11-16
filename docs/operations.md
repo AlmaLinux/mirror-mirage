@@ -182,7 +182,10 @@ causes:
 - **Expired credentials.** Update `secrets.yaml`, restart. The queue
   re-tries automatically.
 - **CDN-side rate limiting.** Mirror Mirage backs off; queue depth will recover
-  once the CDN catches up.
+  once the CDN catches up. For CloudFront, `event=cloudfront_in_progress_limit`
+  means the distribution has 3,000 paths being invalidated and the queue
+  is paused until CloudFront finishes some of them; that is expected during
+  large syncs.
 - **Wrong distribution / service ID.** Check `config.yaml`. Failed jobs
   end up in `status='failed'`.
 
