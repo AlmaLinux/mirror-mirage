@@ -9,6 +9,7 @@ All providers implement the same protocol:
 class CdnProvider(Protocol):
     async def purge(self, urls: list[str]) -> PurgeResult: ...
 
+
 @dataclass(frozen=True)
 class PurgeResult:
     ok: bool

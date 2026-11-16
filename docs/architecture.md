@@ -300,8 +300,7 @@ async def run(cfg: Config, *, dry_run: bool = False) -> None:
     providers = build_providers(cfg, dry_run=dry_run)
     batcher = Batcher(queue, cfg.daemon)
     symlinks = SymlinkIndex()
-    mapper = Mapper(cfg.watches, symlinks=symlinks,
-                    max_aliases=cfg.daemon.max_aliases_per_event)
+    mapper = Mapper(cfg.watches, symlinks=symlinks, max_aliases=cfg.daemon.max_aliases_per_event)
     filter_ = EventFilter(cfg.watches)
     watcher = InotifyWatcher(cfg.watches, symlinks=symlinks)
 
