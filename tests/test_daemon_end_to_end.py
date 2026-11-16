@@ -11,8 +11,11 @@ Skipped on non-Linux hosts (inotify is Linux-only).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
@@ -53,6 +56,53 @@ def _simulate_rsync_push(mirror_tree: Path, files: list[str]) -> list[Path]:
     return rendered
 
 
+async def _wait_for(condition: Callable[[], bool], seconds: float = 10.0) -> bool:
+    """Poll ``condition`` every 50 ms until it holds or ``seconds`` pass."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while not condition():
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
+async def _start_daemon(cfg: Config) -> asyncio.Task[None]:
+    """Run the daemon in a task and return once it has logged ``event=ready``.
+
+    The watcher adds every inotify watch before that line, so changes made
+    after this returns are seen. A fixed sleep was flaky on slow CI runners:
+    changes made before the watches existed were never reported.
+    """
+    ready = asyncio.Event()
+
+    class ReadyHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage().startswith("event=ready "):
+                ready.set()
+
+    logger = logging.getLogger("mirror_mirage.daemon")
+    handler = ReadyHandler()
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    task = asyncio.create_task(daemon_run(cfg))
+    try:
+        await _wait_for(lambda: ready.is_set() or task.done())
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+    if ready.is_set():
+        return task
+    if task.done():
+        await task  # re-raises the startup error
+        pytest.fail("daemon exited before logging event=ready")
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    pytest.fail("daemon did not log event=ready within 10 s")
+
+
 class TestEndToEnd:
     async def test_rsync_push_produces_one_batch_per_cdn(
         self, basic_config: Config, mirror_tree: Path, monkeypatch
@@ -70,11 +120,8 @@ class TestEndToEnd:
         # Some implementations may import build_providers at module load.
         monkeypatch.setattr("mirror_mirage.providers.build_providers", fake_build, raising=False)
 
-        task = asyncio.create_task(daemon_run(basic_config))
+        task = await _start_daemon(basic_config)
         try:
-            # Give the watcher time to register watches.
-            await asyncio.sleep(0.2)
-
             files = [
                 "9/os/x86_64/repodata/repomd.xml",
                 "9/os/x86_64/repodata/primary.xml.gz",
@@ -84,10 +131,7 @@ class TestEndToEnd:
 
             # Wait for the quiet window to elapse and the queue worker
             # to drain at least one batch per CDN.
-            for _ in range(40):  # up to 2 s
-                if all(r.batches for r in recorders.values()):
-                    break
-                await asyncio.sleep(0.05)
+            await _wait_for(lambda: all(r.batches for r in recorders.values()))
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -140,17 +184,13 @@ class TestEndToEnd:
         monkeypatch.setattr("mirror_mirage.daemon.build_providers", fake_build, raising=False)
         monkeypatch.setattr("mirror_mirage.providers.build_providers", fake_build, raising=False)
 
-        task = asyncio.create_task(daemon_run(basic_config))
+        task = await _start_daemon(basic_config)
         try:
-            await asyncio.sleep(0.2)
             # The way rsync and `ln -sfn` do it: new link, renamed over the old.
             tmp = mirror_tree / ".10.AbCdEf"
             tmp.symlink_to("10.3")
             os.replace(tmp, mirror_tree / "10")
-            for _ in range(40):  # up to 2 s
-                if all(r.batches for r in recorders.values()):
-                    break
-                await asyncio.sleep(0.05)
+            await _wait_for(lambda: all(r.batches for r in recorders.values()))
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -188,16 +228,12 @@ class TestEndToEnd:
         monkeypatch.setattr("mirror_mirage.daemon.build_providers", fake_build, raising=False)
         monkeypatch.setattr("mirror_mirage.providers.build_providers", fake_build, raising=False)
 
-        task = asyncio.create_task(daemon_run(basic_config))
+        task = await _start_daemon(basic_config)
         try:
-            await asyncio.sleep(0.2)
             (mirror_tree / "10").unlink()
             await asyncio.sleep(0.05)
             (mirror_tree / "10").symlink_to("10.3")
-            for _ in range(40):  # up to 2 s
-                if all(r.batches for r in recorders.values()):
-                    break
-                await asyncio.sleep(0.05)
+            await _wait_for(lambda: all(r.batches for r in recorders.values()))
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -231,9 +267,8 @@ class TestEndToEnd:
         monkeypatch.setattr("mirror_mirage.daemon.build_providers", fake_build, raising=False)
         monkeypatch.setattr("mirror_mirage.providers.build_providers", fake_build, raising=False)
 
-        task = asyncio.create_task(daemon_run(basic_config))
+        task = await _start_daemon(basic_config)
         try:
-            await asyncio.sleep(0.2)
             # Write into staging but never rename out.
             staging = mirror_tree / "9/os/x86_64/repodata/.~tmp~"
             staging.mkdir(parents=True, exist_ok=True)
@@ -251,7 +286,19 @@ class TestEndToEnd:
             )
 
 
-async def _run_until_batches(cfg: Config, monkeypatch, action) -> dict[str, RecordingProvider]:
+async def _run_until_batches(
+    cfg: Config,
+    monkeypatch,
+    action: Callable[[], None],
+    *,
+    start_when: Callable[[], bool] | None = None,
+    stop_when: Callable[[], bool] | None = None,
+) -> dict[str, RecordingProvider]:
+    """Start the daemon, run ``action``, and wait for each CDN's first batch.
+
+    ``start_when`` must hold before ``action`` runs, and ``stop_when`` must
+    hold (as well as every CDN having a batch) before the daemon is stopped.
+    """
     recorders = {
         "fastly_main": RecordingProvider("fastly_main"),
         "cloudfront_us": RecordingProvider("cloudfront_us"),
@@ -262,14 +309,16 @@ async def _run_until_batches(cfg: Config, monkeypatch, action) -> dict[str, Reco
 
     monkeypatch.setattr("mirror_mirage.daemon.build_providers", fake_build, raising=False)
     monkeypatch.setattr("mirror_mirage.providers.build_providers", fake_build, raising=False)
-    task = asyncio.create_task(daemon_run(cfg))
+    task = await _start_daemon(cfg)
     try:
-        await asyncio.sleep(0.2)
+        if start_when is not None:
+            assert await _wait_for(start_when), "start_when never held"
         action()
-        for _ in range(40):  # up to 2 s
-            if all(r.batches for r in recorders.values()):
-                break
-            await asyncio.sleep(0.05)
+        await _wait_for(
+            lambda: (
+                all(r.batches for r in recorders.values()) and (stop_when is None or stop_when())
+            )
+        )
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -395,11 +444,13 @@ class TestEdgeAliases:
             tmp.symlink_to("AlmaLinux-10.3-1-x86_64-dvd.iso")
             os.replace(tmp, iso_dir / "AlmaLinux-10-latest-x86_64-dvd.iso")
 
-        await _run_until_batches(cfg, monkeypatch, retarget)
-        for _ in range(40):
-            if _FakeDictionaryClient.data[latest_key].endswith("10.3-1-x86_64-dvd.iso"):
-                break
-            await asyncio.sleep(0.05)
-        assert _FakeDictionaryClient.data[latest_key] == (
-            "/almalinux/10.3/isos/x86_64/AlmaLinux-10.3-1-x86_64-dvd.iso"
+        new_target = "/almalinux/10.3/isos/x86_64/AlmaLinux-10.3-1-x86_64-dvd.iso"
+        await _run_until_batches(
+            cfg,
+            monkeypatch,
+            retarget,
+            # The startup sync has published the first spin.
+            start_when=lambda: latest_key in _FakeDictionaryClient.data,
+            stop_when=lambda: _FakeDictionaryClient.data.get(latest_key) == new_target,
         )
+        assert _FakeDictionaryClient.data[latest_key] == new_target
