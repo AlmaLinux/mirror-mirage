@@ -12,8 +12,9 @@ cdns:
     # Optional: publish alias -> real path items for these URL paths to an
     # edge dictionary, for a VCL snippet that rewrites req.url so every
     # symlink alias of a file shares one cache entry. Needs a global-scope
-    # token restricted to this service, plus a one-time dictionary and
-    # snippet on the service: see docs/cdn-providers.md#fastly-edge-aliases.
+    # token limited to the services Mirror Mirage manages, plus a one-time
+    # dictionary and snippet on the service: see
+    # docs/cdn-providers.md#fastly-edge-aliases.
     # edge_aliases:
     #   dictionary: mirage_aliases
     #   rules:

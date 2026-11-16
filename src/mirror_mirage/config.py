@@ -99,7 +99,7 @@ class FastlyCdn(BaseModel):
 
     ``edge_aliases`` turns on edge dictionary sync (see
     :class:`EdgeAliasesConfig`). Writing dictionary items needs a token
-    with ``global`` scope; restrict it to this one service.
+    with ``global`` scope; limit it to the services Mirror Mirage manages.
     """
 
     model_config = ConfigDict(extra="forbid")

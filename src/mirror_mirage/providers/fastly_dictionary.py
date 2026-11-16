@@ -16,7 +16,8 @@ API calls:
   ``upsert`` / ``delete`` operations per request.
 
 The token needs ``global`` scope for the PATCH (Fastly has no narrower
-scope that can write dictionary items); restrict it to the one service.
+scope that can write dictionary items); limit it to the services Mirror Mirage
+manages.
 """
 
 from __future__ import annotations

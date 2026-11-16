@@ -162,8 +162,9 @@ if (table.contains(mirage_aliases, req.url.path)) {
    logging.
 3. Activate the version. The dictionary is empty, so nothing changes yet.
 4. Give the CDN's `api_token` `global` scope. Writing dictionary items
-   needs it (Fastly has no narrower scope that can), so restrict the
-   token to this one service. Don't share it with CDNs on other services.
+   needs it (Fastly has no narrower scope that can), so limit the token
+   to the services Mirror Mirage manages. One token can serve several
+   Fastly CDNs; each CDN entry in `secrets.yaml` just repeats it.
 
 ### Rollout
 
