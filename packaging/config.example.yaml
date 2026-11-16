@@ -41,6 +41,10 @@ watches:
         url_prefix: https://repo.example.org/example-distro/
       - cdn: cloudfront_us
         url_prefix: https://cdn-us.example.org/example-distro/
+        # A change to a file also purges the other URLs that reach it
+        # through symlinks (e.g. 9/... when 9 -> 9.9). On by default; turn
+        # it off for a CDN where the extra paths cost too much.
+        purge_aliases: true
       - cdn: gcp_eu
         url_prefix: https://cdn-eu.example.org/example-distro/
 
@@ -55,6 +59,7 @@ daemon:
   batch_quiet_window_seconds: 10
   batch_max_size: 500
   batch_max_age_seconds: 60
+  max_aliases_per_event: 32
   queue_db: /var/lib/mirror-mirage/queue.db
   retry:
     max_attempts: 8

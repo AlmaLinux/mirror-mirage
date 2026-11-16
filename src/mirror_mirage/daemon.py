@@ -21,6 +21,7 @@ from mirror_mirage.mapper import Mapper
 from mirror_mirage.providers import build_providers
 from mirror_mirage.providers.base import CdnProvider, PurgeResult, summarize_messages
 from mirror_mirage.queue import PersistentQueue, exponential_backoff
+from mirror_mirage.symlinks import SymlinkIndex
 from mirror_mirage.watcher import InotifyWatcher
 
 _log = logging.getLogger("mirror_mirage.daemon")
@@ -163,9 +164,15 @@ async def _pipeline(
     filter_: EventFilter,
     mapper: Mapper,
     batcher: Batcher,
+    symlinks: SymlinkIndex,
 ) -> None:
-    """Pump inotify events through filter → mapper → batcher."""
+    """Pump inotify events through filter → mapper → batcher.
+
+    Every event updates the symlink index first, before the filter can
+    drop it, so the mapper's alias lookups see the current links.
+    """
     async for mask_name, abs_path, _watch_root in watcher:
+        symlinks.observe(mask_name, abs_path)
         event = filter_.normalize(mask_name, abs_path)
         if event is None:
             continue
@@ -188,15 +195,21 @@ async def run(cfg: Config, *, dry_run: bool = False) -> None:
 
         providers = build_providers(cfg, dry_run=dry_run)
         batcher = Batcher(queue, cfg.daemon)
-        mapper = Mapper(cfg.watches)
+        symlinks = SymlinkIndex()
+        mapper = Mapper(
+            cfg.watches,
+            symlinks=symlinks,
+            max_aliases=cfg.daemon.max_aliases_per_event,
+        )
         filter_ = EventFilter(cfg.watches)
 
-        async with InotifyWatcher(cfg.watches) as watcher:
+        async with InotifyWatcher(cfg.watches, symlinks=symlinks) as watcher:
             _log.info(
-                "event=ready dry_run=%s watches=%d cdns=%d",
+                "event=ready dry_run=%s watches=%d cdns=%d symlinks=%d",
                 dry_run,
                 len(cfg.watches),
                 len(providers),
+                len(symlinks),
             )
             async with asyncio.TaskGroup() as tg:
                 for cdn_name, provider in providers.items():
@@ -206,7 +219,7 @@ async def run(cfg: Config, *, dry_run: bool = False) -> None:
                     )
                 tg.create_task(batcher.run(), name="mirror-mirage-batcher")
                 tg.create_task(
-                    _pipeline(watcher, filter_, mapper, batcher),
+                    _pipeline(watcher, filter_, mapper, batcher, symlinks),
                     name="mirror-mirage-pipeline",
                 )
     finally:

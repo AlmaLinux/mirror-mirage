@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from mirror_mirage.config import Binding, WatchConfig
+from mirror_mirage.symlinks import SymlinkIndex
 from mirror_mirage.watcher import (
     InotifyLimitError,
     InotifyWatcher,
@@ -226,3 +227,35 @@ class TestPreflightLimit:
         monkeypatch.setattr("mirror_mirage.watcher._read_max_user_watches", lambda: 1_000_000)
         async with InotifyWatcher([watch]):
             pass
+
+
+class TestSymlinkIndexing:
+    async def test_startup_walk_records_links(self, mirror_tree: Path) -> None:
+        (mirror_tree / "10.3").mkdir()
+        (mirror_tree / "10").symlink_to("10.3")
+        (mirror_tree / "10.3" / ".link.AbCdEf").symlink_to("x")  # rsync temp name
+        watch = WatchConfig(
+            path=mirror_tree,
+            ignore=["**/.~tmp~/**", "**/.*.??????"],
+            bindings=[Binding(cdn="fastly_main", url_prefix="https://x.example/")],
+        )
+        index = SymlinkIndex()
+        async with InotifyWatcher([watch], symlinks=index):
+            pass
+        assert index.target(mirror_tree / "10") == mirror_tree / "10.3"
+        assert len(index) == 1
+
+    async def test_dir_moved_out_forgets_its_links(
+        self, mirror_tree: Path, watch: WatchConfig, tmp_path: Path
+    ) -> None:
+        moving = mirror_tree / "10.2"
+        (moving / "isos").mkdir(parents=True)
+        (moving / "isos" / "latest.iso").symlink_to("real.iso")
+        index = SymlinkIndex()
+        async with InotifyWatcher([watch], symlinks=index) as w:
+            assert moving / "isos" / "latest.iso" in index
+            collector = asyncio.create_task(_drain_for(w, 0.4))
+            await asyncio.sleep(0.1)
+            os.rename(moving, tmp_path / "moved-away")
+            await collector
+        assert len(index) == 0

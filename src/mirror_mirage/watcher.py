@@ -32,6 +32,7 @@ from asyncinotify import Inotify, Mask
 
 from mirror_mirage.config import WatchConfig
 from mirror_mirage.filter import matches_any_glob
+from mirror_mirage.symlinks import SymlinkIndex
 
 _log = logging.getLogger("mirror_mirage.watcher")
 
@@ -126,8 +127,22 @@ def _mask_to_name(mask: Mask) -> str | None:
 class InotifyWatcher:
     """Async-iterable inotify wrapper with recursive watch management."""
 
-    def __init__(self, watches: list[WatchConfig]) -> None:
+    def __init__(
+        self,
+        watches: list[WatchConfig],
+        *,
+        symlinks: SymlinkIndex | None = None,
+    ) -> None:
+        """Create a watcher for ``watches``.
+
+        When ``symlinks`` is given, every symlink found during the startup
+        walk is recorded in it, and links inside a directory that is moved
+        out of a watch root are forgotten. Link changes after startup
+        arrive as ordinary events; the daemon passes those to
+        :meth:`SymlinkIndex.observe`.
+        """
         self._watches = watches
+        self._symlinks = symlinks
         self._inotify: Inotify | None = None
         # watched directory path → owning watch root.
         self._dir_to_root: dict[Path, Path] = {}
@@ -221,6 +236,10 @@ class InotifyWatcher:
             try:
                 if entry.is_dir(follow_symlinks=False):
                     self._add_recursive(Path(entry.path), wc)
+                elif self._symlinks is not None and entry.is_symlink():
+                    link = Path(entry.path)
+                    if not self._is_ignored(link, wc.path, wc.ignore):
+                        self._symlinks.record(link)
             except OSError:
                 continue
 
@@ -309,11 +328,16 @@ class InotifyWatcher:
                 continue
 
             if mask & Mask.ISDIR:
-                # Directory event; only IN_CREATE matters (start watching it).
-                if mask & Mask.CREATE and full_path is not None:
-                    wc = self._dir_to_config.get(watch_dir)
-                    if wc is not None:
-                        self._add_dir_and_scan(full_path, wc)
+                # Directory event: IN_CREATE starts watching it. A directory
+                # moved away (or removed) takes its symlinks with it without
+                # an event per link, so drop them from the index here.
+                if full_path is not None:
+                    if mask & Mask.CREATE:
+                        wc = self._dir_to_config.get(watch_dir)
+                        if wc is not None:
+                            self._add_dir_and_scan(full_path, wc)
+                    elif self._symlinks is not None and mask & (Mask.MOVED_FROM | Mask.DELETE):
+                        self._symlinks.forget_tree(full_path)
                 continue
 
             if full_path is None:

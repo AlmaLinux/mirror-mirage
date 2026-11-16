@@ -110,6 +110,10 @@ Providers handle the wildcard according to what the CDN supports:
 - **Path format:** CloudFront wants the *path* portion of the URL, not the
   full URL. The provider strips the scheme and host before submitting.
   E.g. `https://cdn.example.com/foo/bar.rpm` → `/foo/bar.rpm`.
+- **Alias paths:** with `purge_aliases` on (the default), a change to a
+  file also invalidates the other URLs that reach it through symlinks, so
+  files under a version link like `9 -> 9.9` cost two paths each. Set
+  `purge_aliases: false` on the CloudFront binding to opt out.
 - **Wildcards:** `.../9/*` is sent as the path `/9/*`, which CloudFront
   invalidates as a prefix. A wildcard is billed as one path, but counts
   against a separate cap of 15 wildcard paths in progress per

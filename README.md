@@ -34,6 +34,9 @@ change before the first stable release.
 - Symlink-aware: retargeting a directory symlink (`9 -> 9.9`) purges
   everything under the link's URL with a wildcard invalidation, where the
   CDN supports one.
+- Alias-aware: a change to a file also purges the other URLs that reach it
+  through symlinks — `9/...` when `9 -> 9.9`, and `-latest-` names that
+  point at it — so every cached copy is refreshed, not just the real path.
 - Per-CDN debouncing and bulk batching to minimize CDN API calls.
 - SQLite-backed persistent job queue: in-flight and failed flushes survive
   daemon restarts.
@@ -126,6 +129,10 @@ watches:
         url_prefix: "https://repo.almalinux.org/almalinux/"
       - cdn: cloudfront_us
         url_prefix: "https://cdn-us.almalinux.org/almalinux/"
+        # Also purge the other URLs that reach a changed file through
+        # symlinks (default true). CloudFront bills per invalidation path,
+        # so this is the knob to turn off if that cost matters more.
+        purge_aliases: true
 
   - path: /srv/mirror/vault
     ignore:
@@ -141,6 +148,8 @@ daemon:
   batch_max_size: 500
   # Maximum time a URL can sit in the debounce buffer regardless of activity.
   batch_max_age_seconds: 60
+  # Cap on symlink alias URLs per event; only a symlink loop gets near it.
+  max_aliases_per_event: 32
   queue_db: /var/lib/mirror-mirage/queue.db
   retry:
     max_attempts: 8
@@ -233,7 +242,9 @@ inotify → filter → mapper → batcher → SQLite queue → provider
    created or retargeted) and `DELETE` (file is gone).
 3. **Mapper** computes the public URL for each binding on the watch that
    owns the changed file. For `INVALIDATE_TREE` it adds a wildcard URL
-   (`.../9/*`) covering everything under the link.
+   (`.../9/*`) covering everything under the link. It also adds the URL of
+   every alias: each other path that reaches the file through symlinks,
+   found in an in-memory index of the links under the watch roots.
 4. **Batcher** holds `(cdn, url)` pairs in per-CDN buffers. Each new event
    resets a quiet-window timer for that CDN; when the timer fires (or the
    batch hits `batch_max_size` URLs or `batch_max_age_seconds` age), the

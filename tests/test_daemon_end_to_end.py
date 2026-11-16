@@ -248,3 +248,85 @@ class TestEndToEnd:
             assert rec.batches == [], (
                 f"{name}: unexpected batches from staging-only writes: {rec.batches!r}"
             )
+
+
+async def _run_until_batches(cfg: Config, monkeypatch, action) -> dict[str, RecordingProvider]:
+    recorders = {
+        "fastly_main": RecordingProvider("fastly_main"),
+        "cloudfront_us": RecordingProvider("cloudfront_us"),
+    }
+
+    def fake_build(cfg, *, dry_run=False):
+        return dict(recorders)
+
+    monkeypatch.setattr("mirror_mirage.daemon.build_providers", fake_build, raising=False)
+    monkeypatch.setattr("mirror_mirage.providers.build_providers", fake_build, raising=False)
+    task = asyncio.create_task(daemon_run(cfg))
+    try:
+        await asyncio.sleep(0.2)
+        action()
+        for _ in range(40):  # up to 2 s
+            if all(r.batches for r in recorders.values()):
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    return recorders
+
+
+class TestSymlinkAliases:
+    ISO_DIR = "10.3/isos/x86_64"
+
+    def _release(self, mirror_tree: Path) -> Path:
+        iso_dir = mirror_tree / self.ISO_DIR
+        iso_dir.mkdir(parents=True)
+        (iso_dir / "AlmaLinux-10.3-x86_64-dvd.iso").write_bytes(b"first spin")
+        (iso_dir / "AlmaLinux-10-latest-x86_64-dvd.iso").symlink_to("AlmaLinux-10.3-x86_64-dvd.iso")
+        (mirror_tree / "10").symlink_to("10.3")
+        return iso_dir
+
+    async def test_respin_purges_every_alias(
+        self, basic_config: Config, mirror_tree: Path, monkeypatch
+    ) -> None:
+        iso_dir = self._release(mirror_tree)
+
+        def respin() -> None:
+            _simulate_rsync_push(mirror_tree, [f"{self.ISO_DIR}/AlmaLinux-10.3-x86_64-dvd.iso"])
+
+        recorders = await _run_until_batches(basic_config, monkeypatch, respin)
+        assert iso_dir.exists()
+        assert recorders["fastly_main"].batches == [
+            sorted(
+                f"https://repo.almalinux.org/almalinux/{p}"
+                for p in (
+                    "10.3/isos/x86_64/AlmaLinux-10.3-x86_64-dvd.iso",
+                    "10.3/isos/x86_64/AlmaLinux-10-latest-x86_64-dvd.iso",
+                    "10/isos/x86_64/AlmaLinux-10.3-x86_64-dvd.iso",
+                    "10/isos/x86_64/AlmaLinux-10-latest-x86_64-dvd.iso",
+                )
+            )
+        ]
+        assert len(recorders["cloudfront_us"].batches[0]) == 4
+
+    async def test_latest_retarget_purges_link_and_its_alias(
+        self, basic_config: Config, mirror_tree: Path, monkeypatch
+    ) -> None:
+        iso_dir = self._release(mirror_tree)
+        (iso_dir / "AlmaLinux-10.3-1-x86_64-dvd.iso").write_bytes(b"second spin")
+
+        def retarget() -> None:
+            tmp = iso_dir / ".latest.AbCdEf"
+            tmp.symlink_to("AlmaLinux-10.3-1-x86_64-dvd.iso")
+            os.replace(tmp, iso_dir / "AlmaLinux-10-latest-x86_64-dvd.iso")
+
+        recorders = await _run_until_batches(basic_config, monkeypatch, retarget)
+        assert recorders["fastly_main"].batches == [
+            [
+                "https://repo.almalinux.org/almalinux/10.3/isos/x86_64/"
+                "AlmaLinux-10-latest-x86_64-dvd.iso",
+                "https://repo.almalinux.org/almalinux/10/isos/x86_64/"
+                "AlmaLinux-10-latest-x86_64-dvd.iso",
+            ]
+        ]

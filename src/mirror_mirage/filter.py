@@ -21,6 +21,7 @@ events that should never reach the mapper (e.g. files inside an rsync
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from fnmatch import fnmatchcase
@@ -62,6 +63,26 @@ def matches_any_glob(rel_parts: tuple[str, ...], patterns: list[str]) -> bool:
     component with fnmatch semantics.
     """
     return any(_gm(pattern.split("/"), 0, rel_parts, 0) for pattern in patterns)
+
+
+def deepest_first(watches: Iterable[WatchConfig]) -> list[WatchConfig]:
+    """Sort watches so a nested watch comes before the watch that contains it."""
+    return sorted(watches, key=lambda w: len(w.path.parts), reverse=True)
+
+
+def find_watch(watches: Sequence[WatchConfig], path: Path) -> tuple[WatchConfig, Path] | None:
+    """Return the watch that owns ``path`` and the path relative to it.
+
+    ``watches`` must be ordered with :func:`deepest_first`, so the most
+    specific watch wins when watches are nested. Returns ``None`` if no
+    watch contains ``path``.
+    """
+    for w in watches:
+        try:
+            return w, path.relative_to(w.path)
+        except ValueError:
+            continue
+    return None
 
 
 class EventKind(StrEnum):
@@ -106,7 +127,7 @@ class EventFilter:
     def __init__(self, watches: list[WatchConfig]) -> None:
         # Try the most specific (deepest) watch first so a nested watch
         # is preferred over its parent when both could match.
-        self._watches = sorted(watches, key=lambda w: len(w.path.parts), reverse=True)
+        self._watches = deepest_first(watches)
 
     def normalize(self, mask_name: str, abs_path: Path) -> FsEvent | None:
         """Normalize one inotify event.
@@ -125,17 +146,10 @@ class EventFilter:
         For ``IN_CREATE`` and ``IN_MOVED_TO`` this checks whether the path
         is a symlink (one ``lstat``, plus a ``stat`` for links).
         """
-        watch = None
-        rel: Path | None = None
-        for w in self._watches:
-            try:
-                rel = abs_path.relative_to(w.path)
-            except ValueError:
-                continue
-            watch = w
-            break
-        if watch is None or rel is None:
+        found = find_watch(self._watches, abs_path)
+        if found is None:
             return None
+        watch, rel = found
 
         if matches_any_glob(rel.parts, watch.ignore):
             return None

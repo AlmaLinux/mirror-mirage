@@ -29,10 +29,10 @@ top-level [README](../README.md).
                 └──────┬──────┘
                        │ FsEvent(kind, abs_path, watch_root)
                        ▼
-                ┌─────────────┐
-                │  Mapper     │  fs path → public URL, per binding
-                └──────┬──────┘
-                       │ (cdn_name, url) tuples (fan-out)
+                ┌─────────────┐     ┌──────────────┐
+                │  Mapper     │◄────┤ SymlinkIndex │  links under the watch roots
+                └──────┬──────┘     └──────────────┘
+                       │ (cdn_name, url) tuples (fan-out, incl. alias URLs)
                        ▼
                 ┌─────────────┐
                 │  Batcher    │  per-CDN debouncing + size/age caps
@@ -125,6 +125,34 @@ Two responsibilities:
    place is gone by then and is dropped; the rename's own
    `IN_MOVED_TO` carries the change.
 
+### `symlinks.py` — symlink index
+
+A file is often reachable under more than one path: through a file link
+(`AlmaLinux-10-latest-x86_64-dvd.iso -> AlmaLinux-10.3-x86_64-dvd.iso`),
+through a directory link on an ancestor (`10 -> 10.3`), or both. Each path
+is its own URL and its own CDN cache entry, but inotify only reports the
+real path.
+
+`SymlinkIndex` keeps two maps: link → one-hop target and target → links.
+Targets are stored lexically (`normpath(link.parent / readlink(link))`),
+without `stat` or `realpath`, so dangling links are indexed and chains are
+followed one hop at a time. `aliases(path)` walks `path` and each of its
+ancestors, re-roots the path under every link that points there, and
+repeats for each new alias until nothing new turns up or
+`max_aliases_per_event` is reached (only a loop like `a -> .` gets there).
+
+It is kept current from three places:
+
+1. The watcher's startup walk records every symlink it passes (the
+   `os.scandir` entries it already lists, so no extra syscalls beyond one
+   `readlink` per link).
+2. The daemon passes every watcher event to `observe()` *before* the
+   filter, so a link change is tracked even when the filter drops the
+   event (for example a deletion with `flush_on_delete: false`).
+3. When a directory is moved out of or deleted from a watch, the watcher
+   calls `forget_tree()`, because the links inside it produce no events
+   of their own.
+
 ### `mapper.py` — path-to-URL transform
 
 For each `FsEvent`, look up the watch and emit one `(cdn_name, url)` tuple
@@ -141,8 +169,16 @@ queue as an ordinary URL string; each provider decides what to do with it.
 CloudFront and GCP send it as a prefix invalidation, and Fastly skips it
 because its URL purge API has no prefix match.
 
-The function does not consult any state beyond the static binding list, so
-it is pure and unit-testable in isolation.
+When the daemon gives it a `SymlinkIndex`, the mapper also maps every alias
+of the event's path. Each alias goes through the bindings of the watch that
+owns *it* (so a link in one watch pointing into another works), the owning
+watch's `ignore` globs apply, and bindings with `purge_aliases: false` are
+skipped. A change to `10.3/isos/x86_64/AlmaLinux-10.3-x86_64-dvd.iso` with
+`10 -> 10.3` and a `-latest-` link next to the ISO purges four URLs per
+binding.
+
+The mapper does no I/O: the index is in memory, so it stays unit-testable
+in isolation.
 
 ### `batcher.py` — coalescing
 
@@ -234,15 +270,17 @@ async def run(cfg: Config, *, dry_run: bool = False) -> None:
     queue = await PersistentQueue.open(cfg.daemon.queue_db)
     providers = build_providers(cfg, dry_run=dry_run)
     batcher = Batcher(queue, cfg.daemon)
-    mapper = Mapper(cfg.watches)
+    symlinks = SymlinkIndex()
+    mapper = Mapper(cfg.watches, symlinks=symlinks,
+                    max_aliases=cfg.daemon.max_aliases_per_event)
     filter_ = EventFilter(cfg.watches)
-    watcher = InotifyWatcher(cfg.watches)
+    watcher = InotifyWatcher(cfg.watches, symlinks=symlinks)
 
     async with TaskGroup() as tg:
         for cdn_name, provider in providers.items():
             tg.create_task(queue.worker(cdn_name, provider, cfg.daemon.retry))
         tg.create_task(batcher.run())
-        tg.create_task(_pipeline(watcher, filter_, mapper, batcher))
+        tg.create_task(_pipeline(watcher, filter_, mapper, batcher, symlinks))
 ```
 
 `__main__.py` handles argument parsing, signal handling (graceful shutdown
@@ -276,7 +314,8 @@ on SIGTERM/SIGINT), `sd_notify("READY=1")`, and exception logging.
 
 Component boundaries chosen to keep most tests synchronous and offline:
 
-- `filter` and `mapper` are pure functions.
+- `filter` and `mapper` are pure functions; the mapper's symlink index is
+  built directly in tests from links in a `tmp_path` tree.
 - `batcher` is async but takes a fake "enqueue" callable; tests use
   `asyncio.sleep(0)` and the event loop's mocked clock.
 - `queue` is exercised against an in-memory SQLite (`:memory:`) or a

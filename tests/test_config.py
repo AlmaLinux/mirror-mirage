@@ -20,6 +20,7 @@ from mirror_mirage.config import (
     CloudFrontCdn,
     Config,
     ConfigError,
+    DaemonConfig,
     FastlyCdn,
     GcpCdnConfig,
     WatchConfig,
@@ -87,6 +88,13 @@ class TestModelParsing:
             }
         )
         assert wc.flush_on_delete is True
+
+    def test_binding_purges_aliases_by_default(self) -> None:
+        b = Binding(cdn="x", url_prefix="https://x/")
+        assert b.purge_aliases is True
+
+    def test_daemon_max_aliases_default(self) -> None:
+        assert DaemonConfig().max_aliases_per_event == 32
 
     def test_binding_requires_both_fields(self) -> None:
         with pytest.raises(ValidationError):

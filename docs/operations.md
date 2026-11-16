@@ -139,6 +139,38 @@ Two things to keep in mind:
   returns 404s under `/9/`; CDNs may cache those briefly, and the purge
   for the new link clears them.
 
+## Alias URLs
+
+A file that is reachable through symlinks has more than one URL, and each
+URL is cached separately. With `10 -> 10.3` and
+`AlmaLinux-10-latest-x86_64-dvd.iso -> AlmaLinux-10.3-x86_64-dvd.iso`,
+re-spinning the ISO in place purges all four:
+
+```
+/almalinux/10.3/isos/x86_64/AlmaLinux-10.3-x86_64-dvd.iso
+/almalinux/10.3/isos/x86_64/AlmaLinux-10-latest-x86_64-dvd.iso
+/almalinux/10/isos/x86_64/AlmaLinux-10.3-x86_64-dvd.iso
+/almalinux/10/isos/x86_64/AlmaLinux-10-latest-x86_64-dvd.iso
+```
+
+Retargeting the `-latest-` link purges the link's URL and its `/10/` alias.
+The same goes for every file under `10.3/`: each change also purges the
+`/10/` URL, which roughly doubles the purge volume for the current point
+release. That is free on Fastly. On CloudFront it doubles the billed
+invalidation paths; set `purge_aliases: false` on that binding to opt out.
+
+The `event=ready` line reports how many symlinks were indexed at startup
+(`symlinks=N`). An `event=alias_limit_reached` warning means a path
+expanded to `max_aliases_per_event` aliases, which almost always means a
+symlink loop such as `a -> .`; the path's own URL and the aliases found
+so far are still purged.
+
+Limitations: a link with an absolute target only matches when the target
+uses the same path as the watch (not, for example, the device path behind
+a bind mount). A directory *moved* into a watch root, rather than created
+there, is not watched, so neither its files nor its links are tracked until
+the daemon restarts; that predates alias support.
+
 ## Common failures
 
 ### Daemon won't start: "secrets file has insecure permissions"

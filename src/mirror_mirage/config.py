@@ -83,12 +83,21 @@ CdnConfig = Annotated[
 
 
 class Binding(BaseModel):
-    """Single CDN binding inside a watch."""
+    """Single CDN binding inside a watch.
+
+    ``purge_aliases`` (default ``True``) also purges every other URL that
+    reaches a changed file through symlinks — ``/almalinux/10/...`` when
+    ``10 -> 10.3`` and the file lives under ``10.3/``, or the
+    ``-latest-`` name of a file a link points at. Turn it off for a CDN
+    where the extra invalidation paths cost too much (CloudFront bills
+    per path); that CDN then only gets the real path's URL.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     cdn: str
     url_prefix: str
+    purge_aliases: bool = True
 
 
 class WatchConfig(BaseModel):
@@ -121,13 +130,19 @@ class RetryConfig(BaseModel):
 
 
 class DaemonConfig(BaseModel):
-    """Daemon-wide tuning."""
+    """Daemon-wide tuning.
+
+    ``max_aliases_per_event`` caps how many symlink alias paths one event
+    can expand to. Real trees need a handful; the cap only matters for a
+    symlink loop such as ``a -> .``, which would otherwise expand forever.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     batch_quiet_window_seconds: float = 10.0
     batch_max_size: int = 500
     batch_max_age_seconds: float = 60.0
+    max_aliases_per_event: int = Field(default=32, ge=0)
     queue_db: Path = Path("/var/lib/mirror-mirage/queue.db")
     retry: RetryConfig = RetryConfig()
 
