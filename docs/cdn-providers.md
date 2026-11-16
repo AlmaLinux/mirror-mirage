@@ -33,6 +33,19 @@ When an attempt partly fails, the queue worker:
 CloudFront sends the whole batch in one invalidation, so its result
 (`per_url` unset) applies to every URL and the whole batch is retried.
 
+**Wildcard URLs (directory symlinks).** When a symlink to a directory is
+created or retargeted, e.g. `9 -> 9.8` becomes `9 -> 9.9`, everything under
+the link's URL changes. The mapper then queues two URLs per binding: the
+link's own URL (`.../almalinux/9`) and a wildcard (`.../almalinux/9/*`). The
+link's target (`9.9`) is not purged, because its own URLs did not change.
+Providers handle the wildcard according to what the CDN supports:
+
+| CDN        | Wildcard `.../9/*`                                        |
+|------------|-----------------------------------------------------------|
+| CloudFront | Sent as the invalidation path `/almalinux/9/*`.           |
+| GCP        | Sent as the invalidation path `/almalinux/9/*`.           |
+| Fastly     | Skipped and logged (`event=fastly_wildcard_skipped`).     |
+
 ## Fastly
 
 - **Type key:** `fastly`
@@ -67,6 +80,11 @@ CloudFront sends the whole batch in one invalidation, so its result
   purges via *surrogate keys*, but that requires the origin to emit
   `Surrogate-Key` headers — a different config model than the daemon's
   per-filesystem-path event flow.)
+- **Wildcards:** not supported by URL purge. Wildcard URLs from a
+  retargeted directory symlink are skipped (no API call), logged as
+  `event=fastly_wildcard_skipped`, and treated as done. The link's own URL
+  is still purged. Content under the link stays cached on Fastly until its
+  TTL expires.
 - **Idempotency:** safe. Re-purging an already-purged URL is a no-op.
 - **Retryable status codes:** `408`, `425`, `429`, `500`, `502`, `503`,
   `504`, plus any transport-level error (connection reset, timeout).
@@ -92,6 +110,10 @@ CloudFront sends the whole batch in one invalidation, so its result
 - **Path format:** CloudFront wants the *path* portion of the URL, not the
   full URL. The provider strips the scheme and host before submitting.
   E.g. `https://cdn.example.com/foo/bar.rpm` → `/foo/bar.rpm`.
+- **Wildcards:** `.../9/*` is sent as the path `/9/*`, which CloudFront
+  invalidates as a prefix. A wildcard is billed as one path, but counts
+  against a separate cap of 15 wildcard paths in progress per
+  distribution; hitting it is handled like the 3,000-path cap below.
 - **Idempotency:** safe. Multiple invalidations on the same path are
   billed but functionally fine.
 - **Retryable errors:** `Throttling`, `ThrottlingException`,
@@ -140,6 +162,10 @@ CloudFront sends the whole batch in one invalidation, so its result
   A batch of N URLs becomes N API calls.
 - **Path format:** path component of the URL; `host` is the URL's
   hostname, sent as a separate field.
+- **Wildcards:** `.../9/*` is sent as the path `/9/*`. GCP treats a path
+  ending in `*` as a prefix, so this invalidates everything under `/9/`
+  (and, because of the slash, not siblings such as `/9.9/`). It is one
+  API call and counts once against `quota_per_minute`.
 - **Idempotency:** safe. Cache invalidations are absorbed if the path is
   already invalidated.
 - **Quota:** GCP enforces invalidation quotas per project; default is

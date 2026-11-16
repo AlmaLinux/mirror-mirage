@@ -119,6 +119,55 @@ class TestEndToEnd:
             for url in recorders["cloudfront_us"].batches[0]
         )
 
+    async def test_symlink_flip_purges_link_tree_not_target(
+        self, basic_config: Config, mirror_tree: Path, monkeypatch
+    ) -> None:
+        """Retargeting ``10 -> 10.2`` to ``10.3`` purges ``10`` and ``10/*`` only."""
+        for version in ("10.2", "10.3"):
+            (mirror_tree / version / "BaseOS").mkdir(parents=True)
+            (mirror_tree / version / "BaseOS" / "repomd.xml").write_bytes(version.encode())
+        (mirror_tree / "10").symlink_to("10.2")
+
+        recorders = {
+            "fastly_main": RecordingProvider("fastly_main"),
+            "cloudfront_us": RecordingProvider("cloudfront_us"),
+        }
+
+        def fake_build(cfg, *, dry_run=False):
+            return dict(recorders)
+
+        monkeypatch.setattr("mirror_mirage.daemon.build_providers", fake_build, raising=False)
+        monkeypatch.setattr("mirror_mirage.providers.build_providers", fake_build, raising=False)
+
+        task = asyncio.create_task(daemon_run(basic_config))
+        try:
+            await asyncio.sleep(0.2)
+            # The way rsync and `ln -sfn` do it: new link, renamed over the old.
+            tmp = mirror_tree / ".10.AbCdEf"
+            tmp.symlink_to("10.3")
+            os.replace(tmp, mirror_tree / "10")
+            for _ in range(40):  # up to 2 s
+                if all(r.batches for r in recorders.values()):
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert recorders["fastly_main"].batches == [
+            [
+                "https://repo.almalinux.org/almalinux/10",
+                "https://repo.almalinux.org/almalinux/10/*",
+            ]
+        ]
+        assert recorders["cloudfront_us"].batches == [
+            [
+                "https://cdn-us.almalinux.org/almalinux/10",
+                "https://cdn-us.almalinux.org/almalinux/10/*",
+            ]
+        ]
+
     async def test_staging_writes_do_not_purge(
         self, basic_config: Config, mirror_tree: Path, monkeypatch
     ) -> None:

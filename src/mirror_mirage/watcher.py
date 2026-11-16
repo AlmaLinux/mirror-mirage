@@ -10,6 +10,10 @@ events. Responsibilities:
   anything created between ``mkdir`` and watch registration.
 * React to ``IN_DELETE_SELF`` / ``IN_MOVE_SELF`` by dropping watches.
 
+Symlinks are never followed or watched: a symlink to a directory is
+reported like a file (``IN_CREATE`` or ``IN_MOVED_TO`` when it is
+created or replaced), and the filter decides what that means.
+
 The watcher emits ``(mask_name, abs_path, watch_root)`` tuples; the
 filter and mapper consume these.
 """
@@ -112,6 +116,10 @@ def _mask_to_name(mask: Mask) -> str | None:
         return "IN_DELETE"
     if mask & Mask.MOVED_FROM:
         return "IN_MOVED_FROM"
+    if mask & Mask.CREATE:
+        # Only meaningful for symlinks (``ln -s`` produces no other event);
+        # the filter drops it for regular files, which get IN_CLOSE_WRITE.
+        return "IN_CREATE"
     return None
 
 

@@ -103,6 +103,37 @@ on each retry to the URLs that still need purging. This also works for
 any historical job — `done` and `failed` rows are kept in the queue, not
 pruned.
 
+## Release symlink flips
+
+When a version symlink is retargeted (`9 -> 9.8` becomes `9 -> 9.9`), every
+binding on the watch queues the link's own URL plus a wildcard for
+everything under it:
+
+```
+https://repo.example.org/almalinux/9
+https://repo.example.org/almalinux/9/*
+```
+
+CloudFront and GCP invalidate the wildcard as a prefix. Fastly cannot, so it
+logs `event=fastly_wildcard_skipped` and purges only the link's own URL;
+content under `/9/` on Fastly refreshes when its TTL expires. The target
+tree (`9.9`) is not purged by the flip — its URLs did not change.
+
+To confirm a flip was picked up:
+
+```sh
+journalctl -u mirror-mirage --since '1 hour ago' -g '/9/\*'
+```
+
+Two things to keep in mind:
+
+- **Flip after the target is complete.** The purge goes out within about
+  `batch_quiet_window_seconds` of the flip. If `9.9` is still being synced,
+  CDNs can re-cache the incomplete tree (including 404s) under `/9/`.
+- **Deleting a link is not a tree purge.** With `flush_on_delete: true`, a
+  removed symlink is purged as a single URL, because once it is gone there
+  is no way to tell it pointed at a directory. Retargeting is unaffected.
+
 ## Common failures
 
 ### Daemon won't start: "secrets file has insecure permissions"

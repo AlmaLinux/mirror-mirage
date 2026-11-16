@@ -90,7 +90,10 @@ class CloudFrontProvider:
         """Submit one invalidation containing every URL's path.
 
         URLs are converted to paths (the scheme/host are stripped) before
-        being sent to CloudFront. The boto3 call runs inside
+        being sent to CloudFront. A wildcard URL (``.../9/*``) becomes the
+        path ``/9/*``, which CloudFront invalidates as a prefix; it is
+        billed as one path but counts against CloudFront's separate cap
+        of 15 wildcard paths in progress. The boto3 call runs inside
         :func:`asyncio.to_thread` so the event loop is not blocked.
 
         If the distribution is at CloudFront's in-progress invalidation

@@ -147,6 +147,30 @@ class TestFastlyProvider:
         assert (c.ok, c.retryable, c.message) == (False, True, "HTTP 503")
 
     @respx.mock
+    async def test_wildcard_skipped_link_url_purged(self, caplog) -> None:
+        import logging
+
+        caplog.set_level(logging.INFO, logger="mirror_mirage.fastly")
+        # Only the link's own URL has a route; a call for the wildcard
+        # would hit respx's "not mocked" error.
+        route = respx.post("https://api.fastly.com/purge/repo.example.com/almalinux/10").mock(
+            return_value=httpx.Response(200, json={"status": "ok"})
+        )
+        urls = ["https://repo.example.com/almalinux/10", "https://repo.example.com/almalinux/10/*"]
+        async with httpx.AsyncClient() as client:
+            p = FastlyProvider(service_id="svc-id", api_token="fxxx-test", client=client)
+            result = await p.purge(urls)
+        assert result.ok is True
+        assert route.call_count == 1
+        assert result.per_url is not None
+        assert list(result.per_url) == urls
+        assert result.per_url[urls[1]].message.startswith("skipped")
+        assert any(
+            "event=fastly_wildcard_skipped" in r.getMessage() and urls[1] in r.getMessage()
+            for r in caplog.records
+        )
+
+    @respx.mock
     async def test_all_terminal_is_not_retryable(self) -> None:
         respx.post(url__regex=r"https://api\.fastly\.com/purge/.*").mock(
             return_value=httpx.Response(401)
@@ -279,6 +303,19 @@ class TestFastlyPurgeAllServiceDomains:
         }
 
     @respx.mock
+    async def test_wildcard_only_batch_skips_discovery(self) -> None:
+        # No routes at all: any discovery or purge call would fail the test.
+        async with httpx.AsyncClient() as client:
+            p = FastlyProvider(
+                service_id="svc-id",
+                api_token="fxxx-test",
+                client=client,
+                purge_all_service_domains=True,
+            )
+            result = await p.purge(["https://repo.example.com/almalinux/10/*"])
+        assert result.ok is True
+
+    @respx.mock
     async def test_discovery_cached_across_purges(self) -> None:
         details = respx.get("https://api.fastly.com/service/svc-id").mock(
             return_value=httpx.Response(200, json=SERVICE_DETAILS)
@@ -408,6 +445,26 @@ class TestCloudFrontProvider:
         paths = batch["Paths"]["Items"]
         assert "/almalinux/9/os/x86_64/repodata/repomd.xml" in paths
         assert "/almalinux/9/os/x86_64/Packages/x.rpm" in paths
+
+    async def test_wildcard_sent_as_prefix_path(self) -> None:
+        with patch("mirror_mirage.providers.cloudfront.boto3") as mock_boto:
+            client = MagicMock()
+            mock_boto.client.return_value = client
+            client.create_invalidation.return_value = {
+                "Invalidation": {"Id": "I123", "Status": "InProgress"}
+            }
+            p = CloudFrontProvider(
+                distribution_id="E1",
+                region="us-east-1",
+                access_key_id="x",
+                secret_access_key="x",
+            )
+            result = await p.purge(
+                ["https://cdn.example.com/almalinux/10", "https://cdn.example.com/almalinux/10/*"]
+            )
+        assert result.ok is True
+        batch = client.create_invalidation.call_args.kwargs["InvalidationBatch"]
+        assert batch["Paths"]["Items"] == ["/almalinux/10", "/almalinux/10/*"]
 
     async def test_throttling_is_retryable(self) -> None:
         from botocore.exceptions import ClientError
@@ -641,6 +698,31 @@ class TestGcpCdnProvider:
         payload = json.loads(body)
         assert payload["host"] == "cdn-eu.almalinux.org"
         assert payload["path"] == "/almalinux/9/os/x86_64/x.rpm"
+
+    @respx.mock
+    async def test_wildcard_sent_as_prefix_path(self, gcp_sa_file: Path) -> None:
+        route = respx.post(
+            "https://compute.googleapis.com/compute/v1/projects/alma-prod"
+            "/global/urlMaps/alma-prod-lb/invalidateCache"
+        ).mock(return_value=httpx.Response(200, json={"status": "DONE"}))
+        with patch("mirror_mirage.providers.gcp.service_account") as mock_sa:
+            creds = MagicMock()
+            creds.token = "tok"
+            creds.expired = False
+            mock_sa.Credentials.from_service_account_file.return_value = creds
+            async with httpx.AsyncClient() as client:
+                p = GcpCdnProvider(
+                    project="alma-prod",
+                    url_map="alma-prod-lb",
+                    service_account_file=gcp_sa_file,
+                    client=client,
+                )
+                result = await p.purge(["https://cdn-eu.almalinux.org/almalinux/10/*"])
+        import json
+
+        assert result.ok is True
+        payload = json.loads(route.calls[0].request.read())
+        assert payload == {"path": "/almalinux/10/*", "host": "cdn-eu.almalinux.org"}
 
     @respx.mock
     async def test_429_is_retryable(self, gcp_sa_file: Path) -> None:

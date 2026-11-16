@@ -239,6 +239,9 @@ class GcpCdnProvider:
         relying on ``429`` responses because the daemon never has to
         retry-after on the hot path.
 
+        A wildcard URL (``.../9/*``) becomes the path ``/9/*``, which GCP
+        treats as a prefix invalidation of everything under ``/9/``.
+
         The result carries each URL's outcome in ``per_url``, so the
         queue worker retries only the URLs that hit a retryable error.
         """

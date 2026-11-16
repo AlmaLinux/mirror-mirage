@@ -61,6 +61,31 @@ class TestMultipleBindings:
             assert t.url.endswith("/9/os/x86_64/repodata/repomd.xml")
 
 
+class TestInvalidateTree:
+    def test_link_url_and_wildcard_per_binding(self, watch_factory, mirror_tree: Path) -> None:
+        watch = watch_factory(
+            bindings=[
+                Binding(cdn="fastly_main", url_prefix="https://repo.almalinux.org/almalinux/"),
+                Binding(cdn="cloudfront_us", url_prefix="https://cdn-us.almalinux.org/almalinux"),
+            ]
+        )
+        mapper = Mapper([watch])
+        targets = mapper.map(_ev(EventKind.INVALIDATE_TREE, mirror_tree, "10"))
+        assert targets == [
+            PurgeTarget(cdn_name="fastly_main", url="https://repo.almalinux.org/almalinux/10"),
+            PurgeTarget(cdn_name="fastly_main", url="https://repo.almalinux.org/almalinux/10/*"),
+            PurgeTarget(cdn_name="cloudfront_us", url="https://cdn-us.almalinux.org/almalinux/10"),
+            PurgeTarget(
+                cdn_name="cloudfront_us", url="https://cdn-us.almalinux.org/almalinux/10/*"
+            ),
+        ]
+
+    def test_plain_invalidate_has_no_wildcard(self, watch_factory, mirror_tree: Path) -> None:
+        mapper = Mapper([watch_factory()])
+        targets = mapper.map(_ev(EventKind.INVALIDATE, mirror_tree, "10"))
+        assert [t.url for t in targets] == ["https://repo.almalinux.org/almalinux/10"]
+
+
 class TestEdgeCases:
     def test_event_for_unknown_watch_returns_empty(
         self, watch_factory, tmp_path: Path, mirror_tree: Path

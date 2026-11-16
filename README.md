@@ -31,6 +31,9 @@ change before the first stable release.
   subdirectories.
 - Configurable per-watch ignore globs (designed for rsync staging dirs but
   works for any pattern).
+- Symlink-aware: retargeting a directory symlink (`9 -> 9.9`) purges
+  everything under the link's URL with a wildcard invalidation, where the
+  CDN supports one.
 - Per-CDN debouncing and bulk batching to minimize CDN API calls.
 - SQLite-backed persistent job queue: in-flight and failed flushes survive
   daemon restarts.
@@ -225,10 +228,12 @@ inotify → filter → mapper → batcher → SQLite queue → provider
    `watches[].path`, recursively. New subdirectories get a watch the moment
    they appear.
 2. **Filter** drops events whose path matches an `ignore` glob and
-   normalizes inotify event types into two outcomes: `INVALIDATE` (file is
-   now live or replaced) and `DELETE` (file is gone).
+   normalizes inotify event types into three outcomes: `INVALIDATE` (file
+   is now live or replaced), `INVALIDATE_TREE` (a directory symlink was
+   created or retargeted) and `DELETE` (file is gone).
 3. **Mapper** computes the public URL for each binding on the watch that
-   owns the changed file.
+   owns the changed file. For `INVALIDATE_TREE` it adds a wildcard URL
+   (`.../9/*`) covering everything under the link.
 4. **Batcher** holds `(cdn, url)` pairs in per-CDN buffers. Each new event
    resets a quiet-window timer for that CDN; when the timer fires (or the
    batch hits `batch_max_size` URLs or `batch_max_age_seconds` age), the

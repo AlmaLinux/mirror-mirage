@@ -28,12 +28,15 @@ from urllib.parse import urlparse, urlunparse
 
 import httpx
 
-from mirror_mirage.providers.base import PurgeResult
+from mirror_mirage.providers.base import PurgeResult, is_wildcard
 
 FASTLY_API_BASE = "https://api.fastly.com"
 FASTLY_DEFAULT_CONCURRENCY = 10
 
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+_WILDCARD_SKIPPED = PurgeResult(
+    ok=True, retryable=False, message="skipped: Fastly URL purge has no wildcard support"
+)
 _log = logging.getLogger("mirror_mirage.fastly")
 
 
@@ -259,6 +262,10 @@ class FastlyProvider:
         first expanded into one variant per domain attached to the
         service, and every distinct variant is purged once.
 
+        Wildcard URLs (``.../9/*``, from a retargeted directory symlink)
+        are skipped: Fastly's URL purge has no prefix match. They are
+        logged and reported as done so they are not retried.
+
         The result carries each *input* URL's outcome in ``per_url``, so
         the queue worker retries only the URLs that hit a retryable
         error. With domain expansion, an input URL's outcome combines
@@ -267,19 +274,33 @@ class FastlyProvider:
         if not urls:
             return PurgeResult(ok=True, retryable=False, message="empty")
 
-        if self._purge_all_service_domains:
-            domains, err = await self._ensure_domains()
-            if err is not None:
-                return err
-            variants = {url: _domain_variants(url, domains) for url in urls}
-        else:
-            variants = {url: [url] for url in urls}
+        wildcards = [u for u in urls if is_wildcard(u)]
+        if wildcards:
+            _log.info(
+                "event=fastly_wildcard_skipped service_id=%s urls=%s",
+                self._service_id,
+                ",".join(wildcards),
+            )
+        plain = [u for u in urls if not is_wildcard(u)]
 
-        # Purge each distinct URL once, even if several inputs expand to it.
-        targets = list(dict.fromkeys(v for vs in variants.values() for v in vs))
-        results = dict(
-            zip(targets, await asyncio.gather(*(self._purge_one(t) for t in targets)), strict=True)
-        )
-        return PurgeResult.from_per_url(
-            {url: _combine_variants(vs, results) for url, vs in variants.items()}
-        )
+        outcomes: dict[str, PurgeResult] = dict.fromkeys(wildcards, _WILDCARD_SKIPPED)
+        if plain:
+            if self._purge_all_service_domains:
+                domains, err = await self._ensure_domains()
+                if err is not None:
+                    return err
+                variants = {url: _domain_variants(url, domains) for url in plain}
+            else:
+                variants = {url: [url] for url in plain}
+
+            # Purge each distinct URL once, even if several inputs expand to it.
+            targets = list(dict.fromkeys(v for vs in variants.values() for v in vs))
+            results = dict(
+                zip(
+                    targets,
+                    await asyncio.gather(*(self._purge_one(t) for t in targets)),
+                    strict=True,
+                )
+            )
+            outcomes.update({url: _combine_variants(vs, results) for url, vs in variants.items()})
+        return PurgeResult.from_per_url({u: outcomes[u] for u in urls})

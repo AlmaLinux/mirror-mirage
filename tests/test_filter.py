@@ -3,8 +3,11 @@
 Verifies the rules in ``docs/architecture.md``:
 
 * ``IN_MOVED_TO`` / ``IN_CLOSE_WRITE`` → ``INVALIDATE``.
+* ``IN_CREATE`` / ``IN_MOVED_TO`` on a symlink → ``INVALIDATE_TREE`` for a
+  directory (or dangling) link, ``INVALIDATE`` for a file link.
 * ``IN_DELETE`` / ``IN_MOVED_FROM`` → ``DELETE``.
-* ``IN_CREATE``, ``IN_OPEN``, and other non-relevant masks → dropped.
+* ``IN_CREATE`` on a non-symlink, ``IN_OPEN``, and other non-relevant
+  masks → dropped.
 * Paths matching the watch's ``ignore`` globs are dropped.
 * Paths outside every configured watch are dropped.
 """
@@ -57,6 +60,64 @@ class TestNormalize:
 
     def test_open_is_dropped(self, filter_: EventFilter, mirror_tree: Path) -> None:
         assert filter_.normalize("IN_OPEN", mirror_tree / "9/os/x86_64/Packages/x.rpm") is None
+
+
+class TestSymlinks:
+    """A created or replaced symlink is classified by what it points at."""
+
+    @pytest.mark.parametrize("mask", ["IN_MOVED_TO", "IN_CREATE"])
+    def test_directory_link_yields_invalidate_tree(
+        self, filter_: EventFilter, mirror_tree: Path, mask: str
+    ) -> None:
+        (mirror_tree / "10.3").mkdir()
+        link = mirror_tree / "10"
+        link.symlink_to("10.3")
+        ev = filter_.normalize(mask, link)
+        assert ev is not None
+        assert ev.kind is EventKind.INVALIDATE_TREE
+        assert ev.abs_path == link
+
+    def test_dangling_link_yields_invalidate_tree(
+        self, filter_: EventFilter, mirror_tree: Path
+    ) -> None:
+        # rsync can create "10 -> 10.3" before 10.3 itself arrives.
+        link = mirror_tree / "10"
+        link.symlink_to("10.3")
+        ev = filter_.normalize("IN_MOVED_TO", link)
+        assert ev is not None
+        assert ev.kind is EventKind.INVALIDATE_TREE
+
+    def test_file_link_yields_plain_invalidate(
+        self, filter_: EventFilter, mirror_tree: Path
+    ) -> None:
+        iso = mirror_tree / "9/os/x86_64/AlmaLinux-9.9-x86_64-dvd.iso"
+        iso.write_bytes(b"iso")
+        link = mirror_tree / "9/os/x86_64/AlmaLinux-9-latest-x86_64-dvd.iso"
+        link.symlink_to(iso.name)
+        ev = filter_.normalize("IN_CREATE", link)
+        assert ev is not None
+        assert ev.kind is EventKind.INVALIDATE
+
+    def test_create_of_regular_file_is_dropped(
+        self, filter_: EventFilter, mirror_tree: Path
+    ) -> None:
+        f = mirror_tree / "9/os/x86_64/Packages/new.rpm"
+        f.write_bytes(b"x")
+        assert filter_.normalize("IN_CREATE", f) is None
+
+    def test_link_already_renamed_away_is_dropped(
+        self, filter_: EventFilter, mirror_tree: Path
+    ) -> None:
+        # rsync creates ".10.XXXXXX" then renames it to "10"; by the time
+        # the IN_CREATE for the temp name is processed it no longer exists.
+        assert filter_.normalize("IN_CREATE", mirror_tree / ".10.AbCdEf") is None
+
+    def test_link_in_ignored_path_is_dropped(self, filter_: EventFilter, mirror_tree: Path) -> None:
+        staging = mirror_tree / ".~tmp~"
+        staging.mkdir()
+        link = staging / "10"
+        link.symlink_to("../9")
+        assert filter_.normalize("IN_CREATE", link) is None
 
 
 class TestIgnoreGlobs:

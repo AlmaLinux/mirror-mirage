@@ -70,7 +70,14 @@ IN_MOVED_TO | IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_FROM
 `IN_MOVED_TO` is the primary signal for rsync `--delay-updates`: rsync
 stages new content in `.~tmp~/` and atomically renames it into place.
 `IN_CLOSE_WRITE` covers in-place writes (manual edits, non-rsync tools).
-`IN_DELETE` and `IN_MOVED_FROM` cover removals.
+`IN_DELETE` and `IN_MOVED_FROM` cover removals. `IN_CREATE` on a
+non-directory is passed on because it is the only event a new symlink
+produces; the filter drops it for regular files.
+
+Symlinks are never followed or watched. A symlink to a directory is
+reported like any other entry when it is created (`IN_CREATE`) or
+replaced by rename (`IN_MOVED_TO`, which is how rsync and `ln -sfn`
+retarget a link).
 
 #### Recursion and the inotify race
 
@@ -96,13 +103,27 @@ Two responsibilities:
    never adds a watch on a `.~tmp~/` directory, events inside one could
    still surface if rsync writes to an existing target directory.
 2. **Normalize event kinds.** inotify has many event types; downstream
-   only cares about two:
+   only cares about three:
    - `INVALIDATE` — the file at this path is now live or was replaced.
-     Sources: `IN_MOVED_TO`, `IN_CLOSE_WRITE`.
+     Sources: `IN_MOVED_TO`, `IN_CLOSE_WRITE`, and a symlink to a file
+     being created or replaced.
+   - `INVALIDATE_TREE` — a symlink to a directory was created or
+     retargeted (`IN_CREATE` / `IN_MOVED_TO` on a path that is now a
+     link). When `9 -> 9.8` becomes `9 -> 9.9`, every URL under `/9/`
+     now serves different content, while the URLs under `/9.9/` did not
+     change and are left alone. A dangling link counts as a directory
+     link, because rsync can create `9 -> 9.9` before `9.9` arrives.
    - `DELETE` — the file at this path is gone. Sources: `IN_DELETE`,
      `IN_MOVED_FROM`. Dropped at this stage when the owning watch has
      `flush_on_delete: false` (the default), so deletions never reach
-     the mapper or any provider.
+     the mapper or any provider. A deleted symlink is purged as a
+     plain URL: once it is gone there is no way to tell it pointed at
+     a directory.
+
+   Whether a path is a symlink is checked (`lstat`) when the event is
+   processed. A temporary link that rsync has already renamed into
+   place is gone by then and is dropped; the rename's own
+   `IN_MOVED_TO` carries the change.
 
 ### `mapper.py` — path-to-URL transform
 
@@ -113,6 +134,12 @@ per binding:
 rel = abs_path.relative_to(watch.path)
 url = binding.url_prefix.rstrip("/") + "/" + rel.as_posix()
 ```
+
+An `INVALIDATE_TREE` event emits two tuples per binding: the link's own URL
+and a wildcard, `url + "/*"`. The wildcard travels through the batcher and
+queue as an ordinary URL string; each provider decides what to do with it.
+CloudFront and GCP send it as a prefix invalidation, and Fastly skips it
+because its URL purge API has no prefix match.
 
 The function does not consult any state beyond the static binding list, so
 it is pure and unit-testable in isolation.

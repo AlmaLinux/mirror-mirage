@@ -103,6 +103,37 @@ class TestRsyncStaging:
         assert any(p == target for _, p, _ in events)
 
 
+class TestSymlinks:
+    async def test_new_symlink_yields_create(self, mirror_tree: Path, watch: WatchConfig) -> None:
+        (mirror_tree / "10.3").mkdir()
+        async with InotifyWatcher([watch]) as w:
+            collector = asyncio.create_task(_drain_for(w, 0.5))
+            await asyncio.sleep(0.1)
+            link = mirror_tree / "10"
+            link.symlink_to("10.3")
+            events = await collector
+        assert ("IN_CREATE", link, mirror_tree) in events
+
+    async def test_atomic_retarget_yields_moved_to(
+        self, mirror_tree: Path, watch: WatchConfig
+    ) -> None:
+        """rsync and ``ln -sfn`` swap a link by renaming a temp link over it."""
+        (mirror_tree / "10.2").mkdir()
+        (mirror_tree / "10.3").mkdir()
+        link = mirror_tree / "10"
+        link.symlink_to("10.2")
+        async with InotifyWatcher([watch]) as w:
+            collector = asyncio.create_task(_drain_for(w, 0.5))
+            await asyncio.sleep(0.1)
+            tmp = mirror_tree / ".10.AbCdEf"
+            tmp.symlink_to("10.3")
+            os.replace(tmp, link)
+            events = await collector
+        assert ("IN_MOVED_TO", link, mirror_tree) in events
+        # The link is reported, never followed: nothing under 10.3 shows up.
+        assert not any("10.3" in str(p) for _, p, _ in events)
+
+
 class TestRecursion:
     async def test_new_subdir_is_auto_watched(self, mirror_tree: Path, watch: WatchConfig) -> None:
         async with InotifyWatcher([watch]) as w:

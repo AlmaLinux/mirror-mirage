@@ -7,6 +7,17 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
+# A purge URL ending in this suffix means "everything under this path",
+# e.g. ``https://repo.example.org/almalinux/9/*`` after the ``9`` symlink is
+# retargeted. CloudFront and GCP accept it as-is; providers whose CDN has
+# no prefix purge (Fastly) skip it.
+WILDCARD_SUFFIX = "/*"
+
+
+def is_wildcard(url: str) -> bool:
+    """Return True if ``url`` is a prefix purge ending in :data:`WILDCARD_SUFFIX`."""
+    return url.endswith(WILDCARD_SUFFIX)
+
 
 @dataclass(frozen=True)
 class PurgeResult:
