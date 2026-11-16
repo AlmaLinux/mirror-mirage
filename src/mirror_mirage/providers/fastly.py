@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from typing import Any, cast
 from urllib.parse import urlparse, urlunparse
 
@@ -50,25 +51,40 @@ def _purge_endpoint(url: str) -> str:
     return f"{FASTLY_API_BASE}/purge/{suffix}"
 
 
-def _expand_urls_across_domains(urls: list[str], domains: list[str]) -> list[str]:
-    """Return ``urls`` plus a sibling URL with each domain substituted.
+def _domain_variants(url: str, domains: list[str]) -> list[str]:
+    """Return ``url`` plus a sibling URL for each domain in ``domains``.
 
-    Each input URL is emitted as-is, plus one copy per domain in
-    ``domains`` with the netloc swapped. Deduplicates so a URL whose
-    host already appears in ``domains`` is only purged once.
+    The URL is emitted as-is, plus one copy per domain with the netloc
+    swapped. Deduplicates so a URL whose host already appears in
+    ``domains`` is only purged once.
     """
-    if not domains:
-        return list(urls)
-    expanded: list[str] = []
-    seen: set[str] = set()
-    for url in urls:
-        parsed = urlparse(url)
-        for host in [parsed.netloc, *domains]:
-            replaced = urlunparse(parsed._replace(netloc=host))
-            if replaced not in seen:
-                seen.add(replaced)
-                expanded.append(replaced)
-    return expanded
+    parsed = urlparse(url)
+    variants: list[str] = []
+    for host in [parsed.netloc, *domains]:
+        replaced = urlunparse(parsed._replace(netloc=host))
+        if replaced not in variants:
+            variants.append(replaced)
+    return variants
+
+
+def _combine_variants(variants: list[str], results: Mapping[str, PurgeResult]) -> PurgeResult:
+    """Fold the outcomes of one input URL's domain variants into one outcome.
+
+    The input URL is done only when every variant succeeded. If any
+    variant can be retried, the whole input URL is retried (re-purging
+    its other variants is harmless), so a terminal error on one domain
+    never blocks the retry of another. Failure messages name the host.
+    """
+    if len(variants) == 1:
+        return results[variants[0]]
+    failures = [(v, results[v]) for v in variants if not results[v].ok]
+    if not failures:
+        return PurgeResult(ok=True, retryable=False, message="ok")
+    return PurgeResult(
+        ok=False,
+        retryable=any(r.retryable for _, r in failures),
+        message="; ".join(f"{urlparse(v).netloc}: {r.message}" for v, r in failures),
+    )
 
 
 class FastlyProvider:
@@ -241,13 +257,12 @@ class FastlyProvider:
 
         If ``purge_all_service_domains`` was set, each input URL is
         first expanded into one variant per domain attached to the
-        service; the resulting (possibly larger) URL list is then
-        purged as usual.
+        service, and every distinct variant is purged once.
 
-        If any call returns a terminal error, the overall result is
-        terminal; if any call returns a retryable error and none are
-        terminal, the overall result is retryable. Fastly URL purges
-        are idempotent, so a retry of the whole batch is safe.
+        The result carries each *input* URL's outcome in ``per_url``, so
+        the queue worker retries only the URLs that hit a retryable
+        error. With domain expansion, an input URL's outcome combines
+        all of its variants (see :func:`_combine_variants`).
         """
         if not urls:
             return PurgeResult(ok=True, retryable=False, message="empty")
@@ -256,21 +271,15 @@ class FastlyProvider:
             domains, err = await self._ensure_domains()
             if err is not None:
                 return err
-            urls = _expand_urls_across_domains(urls, domains)
+            variants = {url: _domain_variants(url, domains) for url in urls}
+        else:
+            variants = {url: [url] for url in urls}
 
-        results = await asyncio.gather(*(self._purge_one(u) for u in urls))
-        terminal = [r for r in results if not r.ok and not r.retryable]
-        retryable = [r for r in results if not r.ok and r.retryable]
-        if terminal:
-            return PurgeResult(
-                ok=False,
-                retryable=False,
-                message="; ".join(r.message for r in terminal),
-            )
-        if retryable:
-            return PurgeResult(
-                ok=False,
-                retryable=True,
-                message="; ".join(r.message for r in retryable),
-            )
-        return PurgeResult(ok=True, retryable=False, message="ok")
+        # Purge each distinct URL once, even if several inputs expand to it.
+        targets = list(dict.fromkeys(v for vs in variants.values() for v in vs))
+        results = dict(
+            zip(targets, await asyncio.gather(*(self._purge_one(t) for t in targets)), strict=True)
+        )
+        return PurgeResult.from_per_url(
+            {url: _combine_variants(vs, results) for url, vs in variants.items()}
+        )

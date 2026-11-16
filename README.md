@@ -235,7 +235,8 @@ inotify → filter → mapper → batcher → SQLite queue → provider
    buffer is enqueued as one job.
 5. **Queue** is a small SQLite database. Workers pull pending jobs and call
    the provider; failures reschedule with exponential backoff up to
-   `retry.max_attempts`.
+   `retry.max_attempts`. For CDNs purged URL by URL (Fastly, GCP), only the
+   URLs that hit a retryable error are retried.
 6. **Provider** for each CDN translates the URL list into the appropriate
    API call. See [docs/cdn-providers.md](docs/cdn-providers.md) for the
    per-CDN specifics.

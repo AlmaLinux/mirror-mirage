@@ -239,26 +239,11 @@ class GcpCdnProvider:
         relying on ``429`` responses because the daemon never has to
         retry-after on the hot path.
 
-        If any call returns a terminal error, the overall result is
-        terminal; if any call returns a retryable error and none are
-        terminal, the overall result is retryable.
+        The result carries each URL's outcome in ``per_url``, so the
+        queue worker retries only the URLs that hit a retryable error.
         """
         if not urls:
             return PurgeResult(ok=True, retryable=False, message="empty")
 
-        results = await asyncio.gather(*(self._purge_one(u) for u in urls), return_exceptions=False)
-        terminal = [r for r in results if not r.ok and not r.retryable]
-        retryable = [r for r in results if not r.ok and r.retryable]
-        if terminal:
-            return PurgeResult(
-                ok=False,
-                retryable=False,
-                message="; ".join(r.message for r in terminal),
-            )
-        if retryable:
-            return PurgeResult(
-                ok=False,
-                retryable=True,
-                message="; ".join(r.message for r in retryable),
-            )
-        return PurgeResult(ok=True, retryable=False, message="ok")
+        results = await asyncio.gather(*(self._purge_one(u) for u in urls))
+        return PurgeResult.from_per_url(dict(zip(urls, results, strict=True)))

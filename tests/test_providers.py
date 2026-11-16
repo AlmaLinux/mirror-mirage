@@ -117,12 +117,38 @@ class TestFastlyProvider:
         assert result.retryable is True
 
     @respx.mock
-    async def test_mixed_results_terminal_wins(self) -> None:
-        # If any URL hits a terminal error, the whole batch is terminal.
+    async def test_mixed_results_reported_per_url(self) -> None:
+        # Each URL's outcome is kept so the worker can retry just the
+        # retryable ones; the batch is retryable if any URL is.
         respx.post("https://api.fastly.com/purge/repo.example.com/a").mock(
             return_value=httpx.Response(200, json={"status": "ok"})
         )
         respx.post("https://api.fastly.com/purge/repo.example.com/b").mock(
+            return_value=httpx.Response(401)
+        )
+        respx.post("https://api.fastly.com/purge/repo.example.com/c").mock(
+            return_value=httpx.Response(503)
+        )
+        urls = [
+            "https://repo.example.com/a",
+            "https://repo.example.com/b",
+            "https://repo.example.com/c",
+        ]
+        async with httpx.AsyncClient() as client:
+            p = FastlyProvider(service_id="svc-id", api_token="fxxx-test", client=client)
+            result = await p.purge(urls)
+        assert result.ok is False
+        assert result.retryable is True
+        assert result.per_url is not None
+        assert list(result.per_url) == urls
+        a, b, c = (result.per_url[u] for u in urls)
+        assert a.ok is True
+        assert (b.ok, b.retryable, b.message) == (False, False, "HTTP 401")
+        assert (c.ok, c.retryable, c.message) == (False, True, "HTTP 503")
+
+    @respx.mock
+    async def test_all_terminal_is_not_retryable(self) -> None:
+        respx.post(url__regex=r"https://api\.fastly\.com/purge/.*").mock(
             return_value=httpx.Response(401)
         )
         async with httpx.AsyncClient() as client:
@@ -130,6 +156,7 @@ class TestFastlyProvider:
             result = await p.purge(["https://repo.example.com/a", "https://repo.example.com/b"])
         assert result.ok is False
         assert result.retryable is False
+        assert result.message == "2x HTTP 401"
 
 
 SERVICE_DETAILS: dict[str, object] = {
@@ -181,6 +208,74 @@ class TestFastlyPurgeAllServiceDomains:
             "repo.example.com",
             "mirror.example.com",
             "alt.example.com",
+        }
+
+    @respx.mock
+    async def test_variant_failure_reported_against_input_url(self) -> None:
+        respx.get("https://api.fastly.com/service/svc-id").mock(
+            return_value=httpx.Response(200, json=SERVICE_DETAILS)
+        )
+        respx.get("https://api.fastly.com/service/svc-id/version/42/domain").mock(
+            return_value=httpx.Response(200, json=DOMAINS_PAYLOAD)
+        )
+        status_by_host = {
+            "repo.example.com": 200,
+            "mirror.example.com": 503,
+            "alt.example.com": 400,
+        }
+        respx.post(url__regex=r"https://api\.fastly\.com/purge/.*").mock(
+            side_effect=lambda request: httpx.Response(
+                status_by_host[request.url.path.split("/")[2]]
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            p = FastlyProvider(
+                service_id="svc-id",
+                api_token="fxxx-test",
+                client=client,
+                purge_all_service_domains=True,
+            )
+            result = await p.purge(["https://repo.example.com/foo.rpm"])
+
+        # Keyed by the job's URL, not the expanded variants, so a retry
+        # re-expands it rather than piling variants into the job.
+        assert result.per_url is not None
+        assert list(result.per_url) == ["https://repo.example.com/foo.rpm"]
+        outcome = result.per_url["https://repo.example.com/foo.rpm"]
+        assert outcome.ok is False
+        # One variant can still succeed on retry, so the terminal 400 on
+        # another domain must not stop the retry.
+        assert outcome.retryable is True
+        assert outcome.message == "mirror.example.com: HTTP 503; alt.example.com: HTTP 400"
+
+    @respx.mock
+    async def test_shared_variants_purged_once(self) -> None:
+        respx.get("https://api.fastly.com/service/svc-id").mock(
+            return_value=httpx.Response(200, json=SERVICE_DETAILS)
+        )
+        respx.get("https://api.fastly.com/service/svc-id/version/42/domain").mock(
+            return_value=httpx.Response(200, json=DOMAINS_PAYLOAD)
+        )
+        purge_route = respx.post(url__regex=r"https://api\.fastly\.com/purge/.*").mock(
+            return_value=httpx.Response(200, json={"status": "ok"})
+        )
+        async with httpx.AsyncClient() as client:
+            p = FastlyProvider(
+                service_id="svc-id",
+                api_token="fxxx-test",
+                client=client,
+                purge_all_service_domains=True,
+            )
+            # Both inputs expand to the same three domain variants.
+            result = await p.purge(
+                ["https://repo.example.com/foo.rpm", "https://mirror.example.com/foo.rpm"]
+            )
+        assert result.ok is True
+        assert purge_route.call_count == 3
+        assert result.per_url is not None
+        assert set(result.per_url) == {
+            "https://repo.example.com/foo.rpm",
+            "https://mirror.example.com/foo.rpm",
         }
 
     @respx.mock
@@ -720,6 +815,41 @@ class TestGcpCdnProvider:
         assert result.ok is False
         assert result.retryable is False
 
+    @respx.mock
+    async def test_mixed_results_reported_per_url(self, gcp_sa_file: Path) -> None:
+        import json
+
+        status_by_path = {"/ok": 200, "/gone": 404, "/busy": 429}
+        respx.post(
+            "https://compute.googleapis.com/compute/v1/projects/alma-prod"
+            "/global/urlMaps/alma-prod-lb/invalidateCache"
+        ).mock(
+            side_effect=lambda request: httpx.Response(
+                status_by_path[json.loads(request.content)["path"]]
+            )
+        )
+        urls = ["https://cdn.example/ok", "https://cdn.example/gone", "https://cdn.example/busy"]
+        with patch("mirror_mirage.providers.gcp.service_account") as mock_sa:
+            creds = MagicMock()
+            creds.token = "tok"
+            creds.expired = False
+            mock_sa.Credentials.from_service_account_file.return_value = creds
+            async with httpx.AsyncClient() as client:
+                p = GcpCdnProvider(
+                    project="alma-prod",
+                    url_map="alma-prod-lb",
+                    service_account_file=gcp_sa_file,
+                    client=client,
+                )
+                result = await p.purge(urls)
+        assert result.ok is False
+        assert result.retryable is True
+        assert result.per_url is not None
+        ok, gone, busy = (result.per_url[u] for u in urls)
+        assert ok.ok is True
+        assert (gone.ok, gone.retryable) == (False, False)
+        assert (busy.ok, busy.retryable) == (False, True)
+
     async def test_limiter_stamps_each_call_when_sent(self, gcp_sa_file: Path) -> None:
         """Quota slots are taken just before each request, not up front.
 
@@ -823,3 +953,32 @@ class TestPurgeResult:
     def test_retryable_failure(self) -> None:
         r = PurgeResult(ok=False, retryable=True, message="429")
         assert not r.ok and r.retryable
+
+    def test_from_per_url_all_ok(self) -> None:
+        ok = PurgeResult(ok=True, retryable=False, message="ok")
+        r = PurgeResult.from_per_url({"a": ok, "b": ok})
+        assert r.ok is True
+        assert r.per_url == {"a": ok, "b": ok}
+
+    def test_from_per_url_retryable_if_any_url_retryable(self) -> None:
+        r = PurgeResult.from_per_url(
+            {
+                "a": PurgeResult(ok=True, retryable=False, message="ok"),
+                "b": PurgeResult(ok=False, retryable=False, message="HTTP 404"),
+                "c": PurgeResult(ok=False, retryable=True, message="HTTP 429"),
+                "d": PurgeResult(ok=False, retryable=True, message="HTTP 429"),
+            }
+        )
+        assert r.ok is False
+        assert r.retryable is True
+        assert r.message == "HTTP 404; 2x HTTP 429"
+
+    def test_from_per_url_terminal_only(self) -> None:
+        r = PurgeResult.from_per_url(
+            {
+                "a": PurgeResult(ok=True, retryable=False, message="ok"),
+                "b": PurgeResult(ok=False, retryable=False, message="HTTP 404"),
+            }
+        )
+        assert r.ok is False
+        assert r.retryable is False

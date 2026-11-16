@@ -14,11 +14,24 @@ class PurgeResult:
     ok: bool
     retryable: bool
     message: str
+    per_url: Mapping[str, PurgeResult] | None = None
 ```
 
 `urls` is the list of public URLs Mirror Mirage has decided need flushing. Each
 provider is responsible for translating that list into the appropriate
 API calls.
+
+**Per-URL retry.** Fastly and GCP make one API call per URL, so they report
+each URL's outcome in `per_url` (built with `PurgeResult.from_per_url`).
+When an attempt partly fails, the queue worker:
+
+- drops the URLs that succeeded — they are never purged again;
+- logs the URLs that failed with a terminal error (`event=purge_failed`)
+  and drops them from the job;
+- retries only the URLs that failed with a retryable error.
+
+CloudFront sends the whole batch in one invalidation, so its result
+(`per_url` unset) applies to every URL and the whole batch is retried.
 
 ## Fastly
 
@@ -45,7 +58,9 @@ API calls.
     multiple mirror hostnames (e.g. `repo.example.org` *and*
     `mirror.example.org`) — saves having to list each one as a
     separate binding. Discovery is cached for the daemon's lifetime;
-    restart to pick up newly-added domains.
+    restart to pick up newly-added domains. Retries are tracked per
+    original URL: if any domain's purge hits a retryable error, that URL
+    is retried on every domain.
 - **API used:** Single-URL purge — `POST https://api.fastly.com/purge/{host}{path}[?{query}]`.
   Fastly does not expose a bulk URL purge endpoint; we issue one HTTP
   request per URL with bounded concurrency. (Fastly does support bulk

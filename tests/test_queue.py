@@ -88,6 +88,34 @@ class TestStatusTransitions:
         stats = await queue.stats()
         assert stats.get("failed", 0) == 1
 
+    async def test_reschedule_without_urls_keeps_batch(self, queue: PersistentQueue) -> None:
+        jid = await queue.enqueue("fastly_main", ["https://x/a", "https://x/b"])
+        await queue.claim_ready("fastly_main")
+        await queue.reschedule(jid, attempts=1, next_attempt_at=time.time() - 1)
+        again = await queue.claim_ready("fastly_main")
+        assert again is not None
+        assert again.urls == ["https://x/a", "https://x/b"]
+
+    async def test_reschedule_with_urls_narrows_batch(self, queue: PersistentQueue) -> None:
+        jid = await queue.enqueue("fastly_main", ["https://x/a", "https://x/b", "https://x/c"])
+        await queue.claim_ready("fastly_main")
+        await queue.reschedule(
+            jid, attempts=1, next_attempt_at=time.time() - 1, urls=["https://x/c"]
+        )
+        again = await queue.claim_ready("fastly_main")
+        assert again is not None
+        assert again.id == jid
+        assert again.urls == ["https://x/c"]
+
+    async def test_mark_failed_with_urls_records_only_those(self, queue: PersistentQueue) -> None:
+        jid = await queue.enqueue("fastly_main", ["https://x/a", "https://x/b"])
+        await queue.claim_ready("fastly_main")
+        await queue.mark_failed(jid, "HTTP 404", urls=["https://x/b"])
+        cursor = await queue._conn.execute(
+            "SELECT status, message, urls_json FROM jobs WHERE id = ?", (jid,)
+        )
+        assert await cursor.fetchone() == ("failed", "HTTP 404", '["https://x/b"]')
+
 
 class TestInFlightRecovery:
     async def test_reset_in_flight_returns_count(self, tmp_path: Path) -> None:

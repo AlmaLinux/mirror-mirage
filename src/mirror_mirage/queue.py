@@ -7,7 +7,8 @@ Column              Meaning
 ==================  =========================================================
 ``id``              Auto-incrementing primary key.
 ``cdn_name``        Name of the bound CDN (matches ``Config.cdns`` key).
-``urls_json``       JSON-encoded list of public URLs in the batch.
+``urls_json``       JSON-encoded list of public URLs in the batch. Narrowed on
+                    retry to the URLs that still need purging.
 ``attempts``        Number of times the provider has been called for this job.
 ``next_attempt_at`` Unix timestamp of the earliest next attempt.
 ``created_at``      Unix timestamp the job was enqueued.
@@ -163,22 +164,47 @@ class PersistentQueue:
         *,
         attempts: int,
         next_attempt_at: float,
+        urls: list[str] | None = None,
     ) -> None:
-        """Return a job to ``pending`` with updated ``attempts`` and ``next_attempt_at``."""
-        await self._conn.execute(
-            "UPDATE jobs "
-            "   SET status = 'pending', attempts = ?, next_attempt_at = ? "
-            " WHERE id = ?",
-            (attempts, next_attempt_at, job_id),
-        )
+        """Return a job to ``pending`` with updated ``attempts`` and ``next_attempt_at``.
+
+        When ``urls`` is given it replaces the job's URL list, so the next
+        attempt only covers the URLs that still need purging.
+        """
+        if urls is None:
+            await self._conn.execute(
+                "UPDATE jobs "
+                "   SET status = 'pending', attempts = ?, next_attempt_at = ? "
+                " WHERE id = ?",
+                (attempts, next_attempt_at, job_id),
+            )
+        else:
+            await self._conn.execute(
+                "UPDATE jobs "
+                "   SET status = 'pending', attempts = ?, next_attempt_at = ?, urls_json = ? "
+                " WHERE id = ?",
+                (attempts, next_attempt_at, json.dumps(list(urls)), job_id),
+            )
         await self._conn.commit()
 
-    async def mark_failed(self, job_id: int, message: str) -> None:
-        """Set ``status = 'failed'`` and record the failure message."""
-        await self._conn.execute(
-            "UPDATE jobs SET status = 'failed', message = ? WHERE id = ?",
-            (message, job_id),
-        )
+    async def mark_failed(
+        self, job_id: int, message: str, *, urls: list[str] | None = None
+    ) -> None:
+        """Set ``status = 'failed'`` and record the failure message.
+
+        When ``urls`` is given it replaces the job's URL list, so the
+        failed row lists only the URLs that were not purged.
+        """
+        if urls is None:
+            await self._conn.execute(
+                "UPDATE jobs SET status = 'failed', message = ? WHERE id = ?",
+                (message, job_id),
+            )
+        else:
+            await self._conn.execute(
+                "UPDATE jobs SET status = 'failed', message = ?, urls_json = ? WHERE id = ?",
+                (message, json.dumps(list(urls)), job_id),
+            )
         await self._conn.commit()
 
     async def reset_in_flight(self) -> int:

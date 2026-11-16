@@ -12,13 +12,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 
 from mirror_mirage.batcher import Batcher
 from mirror_mirage.config import Config, RetryConfig
 from mirror_mirage.filter import EventFilter
 from mirror_mirage.mapper import Mapper
 from mirror_mirage.providers import build_providers
-from mirror_mirage.providers.base import CdnProvider, PurgeResult
+from mirror_mirage.providers.base import CdnProvider, PurgeResult, summarize_messages
 from mirror_mirage.queue import PersistentQueue, exponential_backoff
 from mirror_mirage.watcher import InotifyWatcher
 
@@ -39,6 +40,36 @@ def _urls_field(urls: list[str], max_show: int = _URLS_LOG_LIMIT) -> str:
     if len(urls) <= max_show:
         return ",".join(urls)
     return ",".join(urls[:max_show]) + f",+{len(urls) - max_show}-more"
+
+
+@dataclass(frozen=True)
+class _Unpurged:
+    """URLs from a failed attempt, split by what should happen to them next."""
+
+    retry_urls: list[str]
+    retry_message: str
+    failed_urls: list[str]
+    failed_message: str
+
+
+def _split_unpurged(result: PurgeResult, urls: list[str]) -> _Unpurged:
+    """Split a failed attempt's URLs into ones to retry and ones that failed for good.
+
+    URLs the provider reports as purged are left out entirely. A result
+    without ``per_url`` applies to the whole batch.
+    """
+    if result.per_url is None:
+        if result.retryable:
+            return _Unpurged(list(urls), result.message, [], "")
+        return _Unpurged([], "", list(urls), result.message)
+    retry = {u: r for u, r in result.per_url.items() if not r.ok and r.retryable}
+    failed = {u: r for u, r in result.per_url.items() if not r.ok and not r.retryable}
+    return _Unpurged(
+        list(retry),
+        summarize_messages(retry.values()),
+        list(failed),
+        summarize_messages(failed.values()),
+    )
 
 
 async def _queue_worker(
@@ -80,7 +111,19 @@ async def _queue_worker(
             await queue.mark_done(job.id)
             continue
 
-        if result.retryable and attempt < retry.max_attempts:
+        unpurged = _split_unpurged(result, job.urls)
+        if unpurged.retry_urls and attempt < retry.max_attempts:
+            if unpurged.failed_urls:
+                # These URLs are dropped from the job, so this log line is
+                # their only record: list them in full, not truncated.
+                _log.error(
+                    "event=purge_failed cdn=%s job_id=%d attempts=%d error=%r urls=%s",
+                    cdn_name,
+                    job.id,
+                    attempt,
+                    unpurged.failed_message,
+                    ",".join(unpurged.failed_urls),
+                )
             backoff = exponential_backoff(
                 attempt,
                 initial=retry.initial_backoff_seconds,
@@ -92,24 +135,27 @@ async def _queue_worker(
                 job.id,
                 attempt,
                 backoff,
-                result.message,
-                _urls_field(job.urls),
+                unpurged.retry_message,
+                _urls_field(unpurged.retry_urls),
             )
             await queue.reschedule(
                 job.id,
                 attempts=attempt,
                 next_attempt_at=time.time() + backoff,
+                urls=unpurged.retry_urls,
             )
         else:
+            failed_urls = unpurged.failed_urls + unpurged.retry_urls
+            message = "; ".join(m for m in (unpurged.failed_message, unpurged.retry_message) if m)
             _log.error(
                 "event=purge_failed cdn=%s job_id=%d attempts=%d error=%r urls=%s",
                 cdn_name,
                 job.id,
                 attempt,
-                result.message,
-                _urls_field(job.urls),
+                message,
+                _urls_field(failed_urls),
             )
-            await queue.mark_failed(job.id, result.message)
+            await queue.mark_failed(job.id, message, urls=failed_urls)
 
 
 async def _pipeline(

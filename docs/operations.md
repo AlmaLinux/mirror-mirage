@@ -72,12 +72,22 @@ Fields commonly emitted:
 - `latency_ms` — provider call latency.
 - `error` — error message on failure.
 - `job_id` — primary key in the queue.
-- `urls` — comma-separated URLs that landed in this batch, emitted on
-  `purge_ok`, `purge_retry`, and `purge_failed`. Batches of more than
-  five URLs are truncated to `<first-5>,+N-more` to keep the line
-  grep-friendly; the full list is always recoverable from the queue
-  (see the `urls_json` column on the matching `job_id`).
+- `urls` — comma-separated URLs the line is about, emitted on
+  `purge_ok`, `purge_retry`, and `purge_failed`. On `purge_retry`,
+  that is only the URLs being retried. Lists of more than five URLs are
+  truncated to `<first-5>,+N-more` to keep the line grep-friendly; the
+  full list is recoverable from the queue (see the `urls_json` column
+  on the matching `job_id`). The exception is a `purge_failed` line for
+  URLs dropped from a job that is still retrying others: those URLs are
+  not kept in the queue, so the line lists them all.
 - `path`, `url` — only on individual event logs, not batch logs.
+
+For Fastly and GCP, a partly failed attempt is split per URL: URLs that
+succeeded are done, URLs with a terminal error are logged as
+`purge_failed` and dropped, and only URLs with a retryable error are
+retried. So one job can log a `purge_failed` line and later a
+`purge_ok` line for its remaining URLs. CloudFront retries the whole
+batch.
 
 ### Recovering the full URL list for a batch
 
@@ -88,8 +98,10 @@ sudo -u mirror-mirage sqlite3 /var/lib/mirror-mirage/queue.db \
   "SELECT urls_json FROM jobs WHERE id = <job_id>"
 ```
 
-This also works for any historical job — `done` and `failed` rows are
-kept in the queue, not pruned.
+`urls_json` holds the URLs of the job's most recent attempt: it shrinks
+on each retry to the URLs that still need purging. This also works for
+any historical job — `done` and `failed` rows are kept in the queue, not
+pruned.
 
 ## Common failures
 
@@ -176,7 +188,9 @@ causes:
 
 ### Queue has `failed` jobs
 
-These exceeded `retry.max_attempts`. To inspect:
+These hit a terminal error or exceeded `retry.max_attempts`. Their
+`urls_json` lists only the URLs that were not purged, so a replay
+re-purges just those. To inspect:
 
 ```sh
 sudo -u mirror-mirage sqlite3 /var/lib/mirror-mirage/queue.db \
